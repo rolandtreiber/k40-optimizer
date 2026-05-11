@@ -359,20 +359,14 @@ function updateElementStroke(text: string, id: string, color: string) {
   return serializeSvg(doc)
 }
 
-function transformSelection(text: string, ids: string[], transform: string) {
+function applyElementTransforms(text: string, transforms: Map<string, string>) {
   const { doc } = parseSvg(text)
 
-  ids.forEach((id) => {
+  transforms.forEach((transform, id) => {
     const element = doc.querySelector(`[data-k40-id="${CSS.escape(id)}"]`) as SVGElement | null
-    if (!element) {
-      return
+    if (element) {
+      element.setAttribute('transform', transform)
     }
-
-    const existingTransform = element.getAttribute('transform')
-    element.setAttribute(
-      'transform',
-      existingTransform ? `${transform} ${existingTransform}` : transform,
-    )
   })
 
   return serializeSvg(doc)
@@ -438,13 +432,36 @@ function topLevelParts(svg: SVGSVGElement) {
 }
 
 function getElementBox(preview: HTMLDivElement, id: string) {
+  const svg = preview.querySelector('svg') as SVGSVGElement | null
   const element = preview.querySelector(`[data-k40-id="${CSS.escape(id)}"]`) as SVGGraphicsElement | null
-  if (!element || typeof element.getBBox !== 'function') {
+  if (!svg || !element) {
     return null
   }
 
   try {
-    return element.getBBox()
+    const rect = element.getBoundingClientRect()
+    const matrix = svg.getScreenCTM()?.inverse()
+    if (!matrix || rect.width === 0 || rect.height === 0) {
+      return null
+    }
+
+    const corners = [
+      { x: rect.left, y: rect.top },
+      { x: rect.right, y: rect.top },
+      { x: rect.right, y: rect.bottom },
+      { x: rect.left, y: rect.bottom },
+    ].map((corner) => {
+      const point = svg.createSVGPoint()
+      point.x = corner.x
+      point.y = corner.y
+      return point.matrixTransform(matrix)
+    })
+    const minX = Math.min(...corners.map((corner) => corner.x))
+    const minY = Math.min(...corners.map((corner) => corner.y))
+    const maxX = Math.max(...corners.map((corner) => corner.x))
+    const maxY = Math.max(...corners.map((corner) => corner.y))
+
+    return new DOMRect(minX, minY, maxX - minX, maxY - minY)
   } catch {
     return null
   }
@@ -522,11 +539,70 @@ function resizePreview(action: DragAction, box: SelectedBox, point: Point, unifo
   }
 }
 
-function buildResizeTransform(action: DragAction, box: SelectedBox, point: Point, uniform: boolean) {
+function matrixToString(matrix: DOMMatrix) {
+  return `matrix(${matrix.a.toFixed(8)} ${matrix.b.toFixed(8)} ${matrix.c.toFixed(8)} ${matrix.d.toFixed(8)} ${matrix.e.toFixed(4)} ${matrix.f.toFixed(4)})`
+}
+
+function rootMoveMatrix(dx: number, dy: number) {
+  return new DOMMatrix().translate(dx, dy)
+}
+
+function rootRotateMatrix(degrees: number, center: Point) {
+  return new DOMMatrix()
+    .translate(center.x, center.y)
+    .rotate(degrees)
+    .translate(-center.x, -center.y)
+}
+
+function rootResizeMatrix(action: DragAction, box: SelectedBox, point: Point, uniform: boolean) {
   const anchor = getResizeAnchor(action, box)
   const preview = resizePreview(action, box, point, uniform)
+  return new DOMMatrix()
+    .translate(anchor.x, anchor.y)
+    .scale(preview.scaleX, preview.scaleY)
+    .translate(-anchor.x, -anchor.y)
+}
 
-  return `translate(${anchor.x.toFixed(4)} ${anchor.y.toFixed(4)}) scale(${preview.scaleX.toFixed(6)} ${preview.scaleY.toFixed(6)}) translate(${(-anchor.x).toFixed(4)} ${(-anchor.y).toFixed(4)})`
+function domMatrixFromSvgMatrix(matrix: DOMMatrix | SVGMatrix) {
+  return new DOMMatrix([matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f])
+}
+
+function getElementTransformMatrix(element: SVGGraphicsElement) {
+  const transform = element.transform.baseVal.consolidate()
+  return transform ? domMatrixFromSvgMatrix(transform.matrix) : new DOMMatrix()
+}
+
+function buildLocalTransformMap(preview: HTMLDivElement | null, ids: string[], rootDelta: DOMMatrix) {
+  const transforms = new Map<string, string>()
+  const svg = preview?.querySelector('svg') as SVGSVGElement | null
+  if (!svg) {
+    return transforms
+  }
+
+  ids.forEach((id) => {
+    const element = svg.querySelector(`[data-k40-id="${CSS.escape(id)}"]`) as SVGGraphicsElement | null
+    const parent = element?.parentElement as SVGGraphicsElement | SVGSVGElement | null
+    if (!element || !parent) {
+      return
+    }
+
+    const parentCtm = parent === svg ? null : parent.getCTM()
+    const parentMatrix = parent === svg
+      ? new DOMMatrix()
+      : parentCtm
+        ? domMatrixFromSvgMatrix(parentCtm)
+        : null
+    if (!parentMatrix) {
+      return
+    }
+
+    const existingMatrix = getElementTransformMatrix(element)
+    const localDelta = parentMatrix.inverse().multiply(rootDelta).multiply(parentMatrix)
+    const nextMatrix = localDelta.multiply(existingMatrix)
+    transforms.set(id, matrixToString(nextMatrix))
+  })
+
+  return transforms
 }
 
 function containsBox(outer: DOMRect, inner: DOMRect) {
@@ -1175,9 +1251,13 @@ function App() {
     if (dragState.action === 'move') {
       const dx = endPoint.x - dragState.startPoint.x
       const dy = endPoint.y - dragState.startPoint.y
+      const transforms = buildLocalTransformMap(
+        previewRef.current,
+        dragState.selectedIds,
+        rootMoveMatrix(dx, dy),
+      )
       updateSvg(
-        (current) =>
-          transformSelection(current, dragState.selectedIds, `translate(${dx.toFixed(4)} ${dy.toFixed(4)})`),
+        (current) => applyElementTransforms(current, transforms),
         'Selection moved',
       )
       return
@@ -1189,25 +1269,25 @@ function App() {
         y: dragState.startBox.y + dragState.startBox.height / 2,
       }
       const degrees = toDegrees(pointAngle(center, endPoint) - pointAngle(center, dragState.startPoint))
+      const transforms = buildLocalTransformMap(
+        previewRef.current,
+        dragState.selectedIds,
+        rootRotateMatrix(degrees, center),
+      )
       updateSvg(
-        (current) =>
-          transformSelection(
-            current,
-            dragState.selectedIds,
-            `rotate(${degrees.toFixed(3)} ${center.x.toFixed(4)} ${center.y.toFixed(4)})`,
-          ),
+        (current) => applyElementTransforms(current, transforms),
         'Selection rotated',
       )
       return
     }
 
+    const transforms = buildLocalTransformMap(
+      previewRef.current,
+      dragState.selectedIds,
+      rootResizeMatrix(dragState.action, dragState.startBox, endPoint, dragState.uniform),
+    )
     updateSvg(
-      (current) =>
-        transformSelection(
-          current,
-          dragState.selectedIds,
-          buildResizeTransform(dragState.action, dragState.startBox, endPoint, dragState.uniform),
-        ),
+      (current) => applyElementTransforms(current, transforms),
       dragState.uniform ? 'Selection scaled' : 'Selection resized',
     )
   }
