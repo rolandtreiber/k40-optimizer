@@ -2,6 +2,7 @@ import {
   type ChangeEvent,
   type MouseEvent,
   type PointerEvent,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -43,6 +44,52 @@ type HistoryState = {
   past: string[]
   present: string
   future: string[]
+}
+
+type PermissionStateValue = 'granted' | 'denied' | 'prompt'
+
+type LocalFilePermissionDescriptor = {
+  mode?: 'read' | 'readwrite'
+}
+
+type LocalWritableFileStream = {
+  write: (data: string) => Promise<void>
+  close: () => Promise<void>
+}
+
+type LocalFileHandle = {
+  kind: 'file'
+  name: string
+  getFile: () => Promise<File>
+  createWritable: () => Promise<LocalWritableFileStream>
+  queryPermission?: (descriptor?: LocalFilePermissionDescriptor) => Promise<PermissionStateValue>
+  requestPermission?: (descriptor?: LocalFilePermissionDescriptor) => Promise<PermissionStateValue>
+}
+
+type LocalDirectoryHandle = {
+  kind: 'directory'
+  name: string
+  entries: () => AsyncIterableIterator<[string, LocalDirectoryHandle | LocalFileHandle]>
+}
+
+type FilePickerAcceptType = {
+  description: string
+  accept: Record<string, string[]>
+}
+
+type FileSystemWindow = Window & typeof globalThis & {
+  showDirectoryPicker?: () => Promise<LocalDirectoryHandle>
+  showSaveFilePicker?: (options?: {
+    suggestedName?: string
+    types?: FilePickerAcceptType[]
+  }) => Promise<LocalFileHandle>
+}
+
+type FileBrowserItem = {
+  id: string
+  name: string
+  path: string
+  handle: LocalFileHandle
 }
 
 type LayerNode = {
@@ -1092,6 +1139,52 @@ function downloadSvg(text: string, fileName: string) {
   URL.revokeObjectURL(url)
 }
 
+function k40FileName(fileName: string) {
+  return fileName.replace(/\.svg$/i, '') + '-k40.svg'
+}
+
+async function collectSvgFiles(directoryHandle: LocalDirectoryHandle, basePath = directoryHandle.name) {
+  const files: FileBrowserItem[] = []
+
+  for await (const [, handle] of directoryHandle.entries()) {
+    const path = `${basePath}/${handle.name}`
+    if (handle.kind === 'directory') {
+      files.push(...(await collectSvgFiles(handle, path)))
+      continue
+    }
+
+    if (handle.name.toLowerCase().endsWith('.svg')) {
+      files.push({
+        id: path,
+        name: handle.name,
+        path,
+        handle,
+      })
+    }
+  }
+
+  return files.sort((a, b) => a.path.localeCompare(b.path))
+}
+
+async function ensureWritableFile(handle: LocalFileHandle) {
+  const descriptor = { mode: 'readwrite' } as const
+  if (handle.queryPermission && await handle.queryPermission(descriptor) === 'granted') {
+    return true
+  }
+
+  if (handle.requestPermission) {
+    return await handle.requestPermission(descriptor) === 'granted'
+  }
+
+  return true
+}
+
+async function writeSvgFile(handle: LocalFileHandle, text: string) {
+  const writable = await handle.createWritable()
+  await writable.write(text)
+  await writable.close()
+}
+
 function LayerTree({
   nodes,
   selectedIds,
@@ -1153,13 +1246,71 @@ function LayerTree({
   return <ul className="layer-tree">{nodes.map((node) => renderNode(node, 0))}</ul>
 }
 
+function FileBrowser({
+  files,
+  activeFileId,
+  isDirty,
+  folderName,
+  onOpenFolder,
+  onSelectFile,
+}: {
+  files: FileBrowserItem[]
+  activeFileId: string | null
+  isDirty: boolean
+  folderName: string
+  onOpenFolder: () => void
+  onSelectFile: (file: FileBrowserItem) => void
+}) {
+  return (
+    <div className="file-browser">
+      <div className="file-browser-actions">
+        <button type="button" onClick={onOpenFolder}>
+          Open folder
+        </button>
+        {folderName ? <span>{folderName}</span> : null}
+      </div>
+      {files.length > 0 ? (
+        <ul className="file-tree">
+          {files.map((file) => {
+            const isActive = file.id === activeFileId
+            return (
+              <li key={file.id}>
+                <button
+                  type="button"
+                  className={`file-row ${isActive ? 'active' : ''}`}
+                  onClick={() => onSelectFile(file)}
+                >
+                  <span className="file-title">
+                    {file.name}
+                    {isActive && isDirty ? <strong>*</strong> : null}
+                  </span>
+                  <span className="file-path">({file.path})</span>
+                </button>
+              </li>
+            )
+          })}
+        </ul>
+      ) : (
+        <p className="empty-state">Open a folder to browse SVG documents.</p>
+      )}
+    </div>
+  )
+}
+
 function App() {
   const [history, setHistory] = useState<HistoryState>(() => ({
     past: [],
     present: normaliseSvg(sampleSvg),
     future: [],
   }))
+  const [savedText, setSavedText] = useState(() => normaliseSvg(sampleSvg))
   const [fileName, setFileName] = useState('k40-sample.svg')
+  const [activeFileHandle, setActiveFileHandle] = useState<LocalFileHandle | null>(null)
+  const [activeFileId, setActiveFileId] = useState<string | null>(null)
+  const [folderName, setFolderName] = useState('')
+  const [folderFiles, setFolderFiles] = useState<FileBrowserItem[]>([])
+  const [pendingFile, setPendingFile] = useState<FileBrowserItem | null>(null)
+  const [isFileDrawerOpen, setIsFileDrawerOpen] = useState(false)
   const [toolMode, setToolMode] = useState<ToolMode>('select')
   const [selectedPoints, setSelectedPoints] = useState<Point[]>([])
   const [selectedIds, setSelectedIds] = useState<string[]>([])
@@ -1171,6 +1322,7 @@ function App() {
   const previewRef = useRef<HTMLDivElement>(null)
   const dragStateRef = useRef<DragState | null>(null)
   const svgText = history.present
+  const isDirty = svgText !== savedText
 
   const svgInfo = useMemo(() => getSvgInfo(svgText), [svgText])
   const sheetCount = useMemo(() => getSheetCount(svgText), [svgText])
@@ -1232,7 +1384,7 @@ function App() {
     setStatus(nextStatus)
   }
 
-  function undo() {
+  const undo = useCallback(() => {
     setHistory((current) => {
       const previous = current.past.at(-1)
       if (!previous) {
@@ -1247,9 +1399,9 @@ function App() {
     })
     setSelectedPoints([])
     setStatus('Undo')
-  }
+  }, [])
 
-  function redo() {
+  const redo = useCallback(() => {
     setHistory((current) => {
       const next = current.future[0]
       if (!next) {
@@ -1264,6 +1416,141 @@ function App() {
     })
     setSelectedPoints([])
     setStatus('Redo')
+  }, [])
+
+  function openSvgText(text: string, nextFileName: string, nextStatus: string, fileHandle: LocalFileHandle | null, fileId: string | null) {
+    const normalised = normaliseSvg(text)
+    commitSvg(normalised, nextStatus, true)
+    setSavedText(normalised)
+    setFileName(nextFileName)
+    setActiveFileHandle(fileHandle)
+    setActiveFileId(fileId)
+    setSelectedIds([])
+    setPendingFile(null)
+  }
+
+  async function openFolder() {
+    const picker = (window as FileSystemWindow).showDirectoryPicker
+    if (!picker) {
+      setStatus('Folder browsing needs a browser with File System Access API support.')
+      return
+    }
+
+    try {
+      const directory = await picker()
+      const files = await collectSvgFiles(directory)
+      setFolderName(directory.name)
+      setFolderFiles(files)
+      setIsFileDrawerOpen(true)
+      setStatus(files.length > 0 ? `${files.length} SVG document${files.length === 1 ? '' : 's'} found` : 'No SVG documents found')
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        return
+      }
+      setStatus(error instanceof Error ? error.message : 'Could not open that folder.')
+    }
+  }
+
+  async function openBrowserFile(file: FileBrowserItem) {
+    try {
+      const source = await file.handle.getFile()
+      openSvgText(await source.text(), file.name, `${file.name} opened`, file.handle, file.id)
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not open that SVG.')
+    }
+  }
+
+  function requestOpenBrowserFile(file: FileBrowserItem) {
+    if (file.id === activeFileId) {
+      setStatus(isDirty ? 'Current document has unsaved changes' : 'Document already open')
+      return
+    }
+
+    if (isDirty) {
+      setPendingFile(file)
+      return
+    }
+
+    void openBrowserFile(file)
+  }
+
+  const saveAsK40File = useCallback(async () => {
+    const nextFileName = k40FileName(fileName)
+    const picker = (window as FileSystemWindow).showSaveFilePicker
+
+    if (!picker) {
+      downloadSvg(svgText, nextFileName)
+      setStatus('Downloaded K40 SVG; browser did not grant write access.')
+      setSavedText(svgText)
+      return true
+    }
+
+    try {
+      const handle = await picker({
+        suggestedName: nextFileName,
+        types: [{
+          description: 'SVG document',
+          accept: { 'image/svg+xml': ['.svg'] },
+        }],
+      })
+      if (!await ensureWritableFile(handle)) {
+        setStatus('Write permission was not granted.')
+        return false
+      }
+
+      await writeSvgFile(handle, svgText)
+      setActiveFileHandle(handle)
+      setActiveFileId(null)
+      setFileName(handle.name)
+      setSavedText(svgText)
+      setStatus(`${handle.name} saved`)
+      return true
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        return false
+      }
+      setStatus(error instanceof Error ? error.message : 'Could not save that SVG.')
+      return false
+    }
+  }, [fileName, svgText])
+
+  const saveCurrentFile = useCallback(async () => {
+    if (!activeFileHandle) {
+      return saveAsK40File()
+    }
+
+    try {
+      if (!await ensureWritableFile(activeFileHandle)) {
+        setStatus('Write permission was not granted.')
+        return false
+      }
+
+      await writeSvgFile(activeFileHandle, svgText)
+      setSavedText(svgText)
+      setStatus(`${fileName} saved`)
+      return true
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not save that SVG.')
+      return false
+    }
+  }, [activeFileHandle, fileName, saveAsK40File, svgText])
+
+  async function savePendingThenOpen() {
+    if (!pendingFile) {
+      return
+    }
+
+    if (await saveCurrentFile()) {
+      await openBrowserFile(pendingFile)
+    }
+  }
+
+  async function discardPendingAndOpen() {
+    if (!pendingFile) {
+      return
+    }
+
+    await openBrowserFile(pendingFile)
   }
 
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
@@ -1276,9 +1563,7 @@ function App() {
     reader.addEventListener('load', () => {
       try {
         const text = String(reader.result ?? '')
-        commitSvg(normaliseSvg(text), `${file.name} opened`, true)
-        setFileName(file.name)
-        setSelectedIds([])
+        openSvgText(text, file.name, `${file.name} opened`, null, null)
       } catch (error) {
         setStatus(error instanceof Error ? error.message : 'Could not open that SVG.')
       }
@@ -1513,8 +1798,12 @@ function App() {
   }
 
   function resetSample() {
-    commitSvg(normaliseSvg(sampleSvg), 'Sample loaded', true)
+    const normalised = normaliseSvg(sampleSvg)
+    commitSvg(normalised, 'Sample loaded', true)
+    setSavedText(normalised)
     setFileName('k40-sample.svg')
+    setActiveFileHandle(null)
+    setActiveFileId(null)
     setSelectedIds([])
   }
 
@@ -1543,6 +1832,39 @@ function App() {
     setStatus(additive ? 'Selection updated' : 'Layer selected')
   }
 
+  useEffect(() => {
+    function handleShortcut(event: KeyboardEvent) {
+      const commandKey = event.metaKey || event.ctrlKey
+      const key = event.key.toLowerCase()
+
+      if (!commandKey) {
+        return
+      }
+
+      if (key === 's') {
+        event.preventDefault()
+        if (event.shiftKey) {
+          void saveAsK40File()
+        } else {
+          void saveCurrentFile()
+        }
+        return
+      }
+
+      if (key === 'z') {
+        event.preventDefault()
+        if (event.shiftKey) {
+          redo()
+        } else {
+          undo()
+        }
+      }
+    }
+
+    window.addEventListener('keydown', handleShortcut)
+    return () => window.removeEventListener('keydown', handleShortcut)
+  }, [redo, saveAsK40File, saveCurrentFile, undo])
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -1557,11 +1879,20 @@ function App() {
           <button type="button" onClick={redo} disabled={history.future.length === 0}>
             Redo
           </button>
+          <button type="button" onClick={() => void saveCurrentFile()} disabled={!isDirty && Boolean(activeFileHandle)}>
+            Save
+          </button>
+          <button type="button" onClick={() => void saveAsK40File()}>
+            Save as K40
+          </button>
           <label className="file-button">
             Open SVG
             <input type="file" accept=".svg,image/svg+xml" onChange={handleFileChange} />
           </label>
-          <button type="button" onClick={() => downloadSvg(svgText, fileName.replace(/\.svg$/i, '') + '-k40.svg')}>
+          <button type="button" onClick={() => void openFolder()}>
+            Open folder
+          </button>
+          <button type="button" onClick={() => downloadSvg(svgText, k40FileName(fileName))}>
             Export SVG
           </button>
         </div>
@@ -1670,7 +2001,7 @@ function App() {
         <section className="preview-column">
           <div className="bed-toolbar">
             <div>
-              <strong>{fileName}</strong>
+              <strong>{fileName}{isDirty ? ' *' : ''}</strong>
               <span>{sheetCount} sheet{sheetCount === 1 ? '' : 's'} · {status}</span>
             </div>
             <button type="button" onClick={resetSample}>
@@ -1851,12 +2182,65 @@ function App() {
 
           <div className="panel-section">
             <h2>Export</h2>
-            <button type="button" className="primary-action" onClick={() => downloadSvg(svgText, fileName.replace(/\.svg$/i, '') + '-k40.svg')}>
+            <button type="button" className="primary-action" onClick={() => downloadSvg(svgText, k40FileName(fileName))}>
               Download K40 SVG
             </button>
           </div>
         </aside>
       </section>
+      {isFileDrawerOpen ? (
+        <aside className="file-drawer" aria-label="SVG files">
+          <div className="file-drawer-header">
+            <h2>Files</h2>
+            <button type="button" className="icon-button" onClick={() => setIsFileDrawerOpen(false)}>
+              Hide
+            </button>
+          </div>
+          <FileBrowser
+            files={folderFiles}
+            activeFileId={activeFileId}
+            isDirty={isDirty}
+            folderName={folderName}
+            onOpenFolder={() => void openFolder()}
+            onSelectFile={requestOpenBrowserFile}
+          />
+        </aside>
+      ) : (
+        <button
+          type="button"
+          className="file-drawer-tab"
+          onClick={() => setIsFileDrawerOpen(true)}
+          title="Show files"
+        >
+          Files
+        </button>
+      )}
+      {pendingFile ? (
+        <div className="modal-backdrop" role="presentation">
+          <div
+            className="confirm-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="unsaved-dialog-title"
+          >
+            <h2 id="unsaved-dialog-title">Unsaved changes</h2>
+            <p>
+              Save changes to {fileName} before opening {pendingFile.name}?
+            </p>
+            <div className="dialog-actions">
+              <button type="button" onClick={() => void savePendingThenOpen()}>
+                Save and open
+              </button>
+              <button type="button" onClick={() => void discardPendingAndOpen()}>
+                Discard and open
+              </button>
+              <button type="button" onClick={() => setPendingFile(null)}>
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </main>
   )
 }
