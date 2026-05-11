@@ -1,7 +1,15 @@
-import { type ChangeEvent, type MouseEvent, useMemo, useRef, useState } from 'react'
+import {
+  type ChangeEvent,
+  type MouseEvent,
+  type PointerEvent,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import './App.css'
 
-type ToolMode = 'measure' | 'cut' | 'engrave'
+type ToolMode = 'select' | 'measure' | 'cut' | 'engrave'
 
 type SvgInfo = {
   widthMm: number
@@ -25,6 +33,9 @@ type Placement = {
   y: number
   width: number
   height: number
+  placedWidth: number
+  placedHeight: number
+  rotation: 0 | 90
 }
 
 type HistoryState = {
@@ -52,6 +63,35 @@ type LayoutCluster = {
   id: string
   parts: LayoutPart[]
   box: DOMRect
+}
+
+type SelectedBox = {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+type DragAction = 'move' | 'resize-nw' | 'resize-ne' | 'resize-sw' | 'resize-se' | 'rotate'
+
+type DragState = {
+  action: DragAction
+  pointerId: number
+  startPoint: Point
+  currentPoint: Point
+  startBox: SelectedBox
+  selectedIds: string[]
+  uniform: boolean
+}
+
+type DragPreview = {
+  dx: number
+  dy: number
+  scaleX: number
+  scaleY: number
+  rotation: number
+  originX: number
+  originY: number
 }
 
 const BED_WIDTH_MM = 300
@@ -319,6 +359,25 @@ function updateElementStroke(text: string, id: string, color: string) {
   return serializeSvg(doc)
 }
 
+function transformSelection(text: string, ids: string[], transform: string) {
+  const { doc } = parseSvg(text)
+
+  ids.forEach((id) => {
+    const element = doc.querySelector(`[data-k40-id="${CSS.escape(id)}"]`) as SVGElement | null
+    if (!element) {
+      return
+    }
+
+    const existingTransform = element.getAttribute('transform')
+    element.setAttribute(
+      'transform',
+      existingTransform ? `${transform} ${existingTransform}` : transform,
+    )
+  })
+
+  return serializeSvg(doc)
+}
+
 function scaleSvg(text: string, scale: number) {
   const { doc, svg } = parseSvg(text)
   const scaleTransform = `scale(${scale.toFixed(6)})`
@@ -344,6 +403,10 @@ function scaleSvg(text: string, scale: number) {
 }
 
 function getLocalPoint(event: MouseEvent<HTMLDivElement>, preview: HTMLDivElement | null) {
+  return getSvgPoint(event.clientX, event.clientY, preview)
+}
+
+function getSvgPoint(clientX: number, clientY: number, preview: HTMLDivElement | null) {
   const svg = preview?.querySelector('svg') as SVGSVGElement | null
   if (!svg) {
     return null
@@ -355,8 +418,8 @@ function getLocalPoint(event: MouseEvent<HTMLDivElement>, preview: HTMLDivElemen
   }
 
   const point = svg.createSVGPoint()
-  point.x = event.clientX
-  point.y = event.clientY
+  point.x = clientX
+  point.y = clientY
   return point.matrixTransform(matrix.inverse())
 }
 
@@ -385,6 +448,85 @@ function getElementBox(preview: HTMLDivElement, id: string) {
   } catch {
     return null
   }
+}
+
+function getSelectionBox(preview: HTMLDivElement | null, ids: string[]) {
+  if (!preview || ids.length === 0) {
+    return null
+  }
+
+  const boxes = ids
+    .map((id) => getElementBox(preview, id))
+    .filter((box): box is DOMRect => Boolean(box))
+
+  if (boxes.length === 0) {
+    return null
+  }
+
+  const box = unionBoxes(boxes)
+  return {
+    x: box.x,
+    y: box.y,
+    width: box.width,
+    height: box.height,
+  }
+}
+
+function percentInViewBox(value: number, start: number, size: number) {
+  return `${((value - start) / size) * 100}%`
+}
+
+function getResizeAnchor(action: DragAction, box: SelectedBox): Point {
+  if (action === 'resize-nw') {
+    return { x: box.x + box.width, y: box.y + box.height }
+  }
+
+  if (action === 'resize-ne') {
+    return { x: box.x, y: box.y + box.height }
+  }
+
+  if (action === 'resize-sw') {
+    return { x: box.x + box.width, y: box.y }
+  }
+
+  return { x: box.x, y: box.y }
+}
+
+function pointAngle(center: Point, point: Point) {
+  return Math.atan2(point.y - center.y, point.x - center.x)
+}
+
+function toDegrees(radians: number) {
+  return (radians * 180) / Math.PI
+}
+
+function resizePreview(action: DragAction, box: SelectedBox, point: Point, uniform: boolean) {
+  const anchor = getResizeAnchor(action, box)
+  let scaleX = Math.abs(point.x - anchor.x) / box.width
+  let scaleY = Math.abs(point.y - anchor.y) / box.height
+
+  if (uniform) {
+    const scale = Math.max(scaleX, scaleY)
+    scaleX = scale
+    scaleY = scale
+  }
+
+  return {
+    dx: 0,
+    dy: 0,
+    scaleX: Math.max(0.05, scaleX),
+    scaleY: Math.max(0.05, scaleY),
+    rotation: 0,
+    originX: ((anchor.x - box.x) / box.width) * 100,
+    originY: ((anchor.y - box.y) / box.height) * 100,
+  }
+}
+
+function buildResizeTransform(action: DragAction, box: SelectedBox, point: Point, uniform: boolean) {
+  const anchor = getResizeAnchor(action, box)
+  const preview = resizePreview(action, box, point, uniform)
+
+  return `translate(${anchor.x.toFixed(4)} ${anchor.y.toFixed(4)}) scale(${preview.scaleX.toFixed(6)} ${preview.scaleY.toFixed(6)}) translate(${(-anchor.x).toFixed(4)} ${(-anchor.y).toFixed(4)})`
 }
 
 function containsBox(outer: DOMRect, inner: DOMRect) {
@@ -449,40 +591,122 @@ function packItems(
   items: Array<{ id: string; width: number; height: number }>,
   gap: number,
 ) {
+  type CandidatePlacement = {
+    sheet: number
+    x: number
+    y: number
+    placedWidth: number
+    placedHeight: number
+    rotation: 0 | 90
+    score: number
+  }
+
   const placements: Placement[] = []
-  let sheet = 0
-  let cursorX = gap
-  let cursorY = gap
-  let rowHeight = 0
+  const placedBySheet: Array<Array<Placement>> = [[]]
 
-  items.forEach((item) => {
-    const width = Math.min(item.width, BED_WIDTH_MM - gap * 2)
-    const height = Math.min(item.height, BED_HEIGHT_MM - gap * 2)
+  function overlaps(sheetPlacements: Placement[], x: number, y: number, width: number, height: number) {
+    return sheetPlacements.some((placed) => {
+      return !(
+        x + width + gap <= placed.x ||
+        placed.x + placed.placedWidth + gap <= x ||
+        y + height + gap <= placed.y ||
+        placed.y + placed.placedHeight + gap <= y
+      )
+    })
+  }
 
-    if (cursorX + width + gap > BED_WIDTH_MM) {
-      cursorX = gap
-      cursorY += rowHeight + gap
-      rowHeight = 0
-    }
+  function candidatePositions(sheetPlacements: Placement[]) {
+    const xs = new Set([gap])
+    const ys = new Set([gap])
 
-    if (cursorY + height + gap > BED_HEIGHT_MM) {
-      sheet += 1
-      cursorX = gap
-      cursorY = gap
-      rowHeight = 0
-    }
-
-    placements.push({
-      id: item.id,
-      sheet,
-      x: cursorX,
-      y: cursorY,
-      width: item.width,
-      height: item.height,
+    sheetPlacements.forEach((placed) => {
+      xs.add(placed.x + placed.placedWidth + gap)
+      xs.add(placed.x)
+      ys.add(placed.y + placed.placedHeight + gap)
+      ys.add(placed.y)
     })
 
-    cursorX += width + gap
-    rowHeight = Math.max(rowHeight, height)
+    return Array.from(xs).flatMap((x) => Array.from(ys).map((y) => ({ x, y })))
+  }
+
+  items.forEach((item) => {
+    let best: CandidatePlacement | null = null
+
+    const orientations: Array<{ placedWidth: number; placedHeight: number; rotation: 0 | 90 }> = [
+      { placedWidth: item.width, placedHeight: item.height, rotation: 0 },
+      { placedWidth: item.height, placedHeight: item.width, rotation: 90 },
+    ]
+
+    for (let sheet = 0; sheet <= placedBySheet.length; sheet += 1) {
+      const sheetPlacements = placedBySheet[sheet] ?? []
+      const candidates = sheetPlacements.length === 0
+        ? [{ x: gap, y: gap }]
+        : candidatePositions(sheetPlacements)
+
+      orientations.forEach((orientation) => {
+        candidates.forEach(({ x, y }) => {
+          if (
+            x + orientation.placedWidth + gap > BED_WIDTH_MM ||
+            y + orientation.placedHeight + gap > BED_HEIGHT_MM ||
+            overlaps(sheetPlacements, x, y, orientation.placedWidth, orientation.placedHeight)
+          ) {
+            return
+          }
+
+          const usedWidth = Math.max(
+            x + orientation.placedWidth,
+            ...sheetPlacements.map((placed) => placed.x + placed.placedWidth),
+          )
+          const usedHeight = Math.max(
+            y + orientation.placedHeight,
+            ...sheetPlacements.map((placed) => placed.y + placed.placedHeight),
+          )
+          const score = sheet * 10_000_000 + usedHeight * 10_000 + usedWidth * 100 + y + x * 0.01
+
+          if (!best || score < best.score) {
+            best = {
+              sheet,
+              x,
+              y,
+              ...orientation,
+              score,
+            }
+          }
+        })
+      })
+    }
+
+    const bestPlacement = best as CandidatePlacement | null
+    const placement: Placement = bestPlacement
+      ? {
+          id: item.id,
+          sheet: bestPlacement.sheet,
+          x: bestPlacement.x,
+          y: bestPlacement.y,
+          width: item.width,
+          height: item.height,
+          placedWidth: bestPlacement.placedWidth,
+          placedHeight: bestPlacement.placedHeight,
+          rotation: bestPlacement.rotation,
+        }
+      : {
+          id: item.id,
+          sheet: placedBySheet.length,
+          x: gap,
+          y: gap,
+          width: item.width,
+          height: item.height,
+          placedWidth: item.width,
+          placedHeight: item.height,
+          rotation: 0,
+        }
+
+    if (!placedBySheet[placement.sheet]) {
+      placedBySheet[placement.sheet] = []
+    }
+
+    placedBySheet[placement.sheet].push(placement)
+    placements.push(placement)
   })
 
   return placements
@@ -553,12 +777,20 @@ function autoLayoutSvg(text: string, preview: HTMLDivElement | null, gapMm: numb
 
     const wrapper = output.createElementNS('http://www.w3.org/2000/svg', 'g')
     const box = cluster.box
-    const translateX = placement.x - box.x * sourceInfo.unitX
-    const translateY = placement.sheet * BED_HEIGHT_MM + placement.y - box.y * sourceInfo.unitY
-    wrapper.setAttribute(
-      'transform',
-      `translate(${translateX.toFixed(4)} ${translateY.toFixed(4)}) scale(${sourceInfo.unitX.toFixed(6)} ${sourceInfo.unitY.toFixed(6)})`,
-    )
+    const targetY = placement.sheet * BED_HEIGHT_MM + placement.y
+    const transform = placement.rotation === 90
+      ? [
+          `translate(${(placement.x + box.height * sourceInfo.unitY).toFixed(4)} ${targetY.toFixed(4)})`,
+          'rotate(90)',
+          `translate(${(-box.x * sourceInfo.unitX).toFixed(4)} ${(-box.y * sourceInfo.unitY).toFixed(4)})`,
+          `scale(${sourceInfo.unitX.toFixed(6)} ${sourceInfo.unitY.toFixed(6)})`,
+        ].join(' ')
+      : [
+          `translate(${(placement.x - box.x * sourceInfo.unitX).toFixed(4)} ${(targetY - box.y * sourceInfo.unitY).toFixed(4)})`,
+          `scale(${sourceInfo.unitX.toFixed(6)} ${sourceInfo.unitY.toFixed(6)})`,
+        ].join(' ')
+
+    wrapper.setAttribute('transform', transform)
     cluster.parts.forEach((sourcePart) => {
       wrapper.appendChild(output.importNode(sourcePart.part, true))
     })
@@ -584,21 +816,34 @@ function downloadSvg(text: string, fileName: string) {
 
 function LayerTree({
   nodes,
+  selectedIds,
   onRename,
+  onSelect,
   onToggleVisibility,
 }: {
   nodes: LayerNode[]
+  selectedIds: string[]
   onRename: (id: string, name: string) => void
+  onSelect: (id: string, additive: boolean) => void
   onToggleVisibility: (id: string, visible: boolean) => void
 }) {
   function renderNode(node: LayerNode, depth: number) {
+    const isSelected = selectedIds.includes(node.id)
+
     return (
       <li className="layer-item" key={`${node.id}-${node.name}-${node.hidden}`}>
-        <div className="layer-row" style={{ paddingLeft: `${depth * 14}px` }}>
+        <div
+          className={`layer-row ${isSelected ? 'selected' : ''}`}
+          style={{ paddingLeft: `${depth * 14}px` }}
+          onClick={(event) => onSelect(node.id, event.shiftKey || event.metaKey)}
+        >
           <button
             type="button"
             className={`icon-button visibility-toggle ${node.hidden ? 'muted' : ''}`}
-            onClick={() => onToggleVisibility(node.id, node.hidden)}
+            onClick={(event) => {
+              event.stopPropagation()
+              onToggleVisibility(node.id, node.hidden)
+            }}
             aria-label={node.hidden ? `Show ${node.name}` : `Hide ${node.name}`}
             title={node.hidden ? 'Show layer' : 'Hide layer'}
           >
@@ -609,6 +854,7 @@ function LayerTree({
             className="layer-name"
             defaultValue={node.name}
             aria-label={`Layer name for ${node.name}`}
+            onClick={(event) => event.stopPropagation()}
             onBlur={(event) => onRename(node.id, event.currentTarget.value)}
             onKeyDown={(event) => {
               if (event.key === 'Enter') {
@@ -636,12 +882,16 @@ function App() {
     future: [],
   }))
   const [fileName, setFileName] = useState('k40-sample.svg')
-  const [toolMode, setToolMode] = useState<ToolMode>('measure')
+  const [toolMode, setToolMode] = useState<ToolMode>('select')
   const [selectedPoints, setSelectedPoints] = useState<Point[]>([])
+  const [selectedIds, setSelectedIds] = useState<string[]>([])
+  const [selectionBox, setSelectionBox] = useState<SelectedBox | null>(null)
+  const [dragPreview, setDragPreview] = useState<DragPreview | null>(null)
   const [targetDistance, setTargetDistance] = useState('')
   const [gapMm, setGapMm] = useState(2)
   const [status, setStatus] = useState('Sample loaded')
   const previewRef = useRef<HTMLDivElement>(null)
+  const dragStateRef = useRef<DragState | null>(null)
   const svgText = history.present
 
   const svgInfo = useMemo(() => getSvgInfo(svgText), [svgText])
@@ -654,6 +904,14 @@ function App() {
     100,
     ((svgInfo.widthMm * svgInfo.heightMm) / (BED_WIDTH_MM * BED_HEIGHT_MM)) * 100,
   )
+
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => {
+      setSelectionBox(getSelectionBox(previewRef.current, selectedIds))
+    })
+
+    return () => cancelAnimationFrame(frame)
+  }, [selectedIds, svgText])
 
   function commitSvg(nextText: string, nextStatus: string, reset = false) {
     setHistory((current) => {
@@ -738,6 +996,7 @@ function App() {
         const text = String(reader.result ?? '')
         commitSvg(normaliseSvg(text), `${file.name} opened`, true)
         setFileName(file.name)
+        setSelectedIds([])
       } catch (error) {
         setStatus(error instanceof Error ? error.message : 'Could not open that SVG.')
       }
@@ -746,6 +1005,31 @@ function App() {
   }
 
   function handlePreviewClick(event: MouseEvent<HTMLDivElement>) {
+    if (toolMode === 'select') {
+      const target = getClickableTarget(event.target)
+      const id = target?.getAttribute('data-k40-id')
+      if (!id) {
+        if (!event.shiftKey && !event.metaKey) {
+          setSelectedIds([])
+        }
+        setStatus('Selection cleared')
+        return
+      }
+
+      const isMultiSelect = event.shiftKey || event.metaKey
+      setSelectedIds((current) => {
+        if (!isMultiSelect) {
+          return [id]
+        }
+
+        return current.includes(id)
+          ? current.filter((selectedId) => selectedId !== id)
+          : [...current, id]
+      })
+      setStatus(isMultiSelect ? 'Selection updated' : 'Element selected')
+      return
+    }
+
     if (toolMode === 'measure') {
       const point = getLocalPoint(event, previewRef.current)
       if (!point) {
@@ -771,6 +1055,18 @@ function App() {
     )
   }
 
+  function handlePreviewPointerDown(event: PointerEvent<HTMLDivElement>) {
+    if (toolMode !== 'select' || !selectionBox) {
+      return
+    }
+
+    const target = getClickableTarget(event.target)
+    const id = target?.getAttribute('data-k40-id')
+    if (id && selectedIds.includes(id)) {
+      beginSelectionDrag(event, 'move')
+    }
+  }
+
   function applyDistanceScale() {
     const nextDistance = Number(targetDistance)
     if (!measuredDistance || !Number.isFinite(nextDistance) || nextDistance <= 0) {
@@ -782,6 +1078,140 @@ function App() {
     updateSvg((current) => normaliseSvg(scaleSvg(current, scale)), `Scaled artwork by ${scale.toFixed(4)}x`)
   }
 
+  function beginSelectionDrag(event: PointerEvent<HTMLElement>, action: DragAction) {
+    if (!selectionBox || selectedIds.length === 0 || toolMode !== 'select') {
+      return
+    }
+
+    const startPoint = getSvgPoint(event.clientX, event.clientY, previewRef.current)
+    if (!startPoint) {
+      return
+    }
+
+    event.preventDefault()
+    event.stopPropagation()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    dragStateRef.current = {
+      action,
+      pointerId: event.pointerId,
+      startPoint,
+      currentPoint: startPoint,
+      startBox: selectionBox,
+      selectedIds: [...selectedIds],
+      uniform: event.shiftKey,
+    }
+    setStatus(action === 'move' ? 'Dragging selection' : 'Editing selection')
+  }
+
+  function updateSelectionDrag(event: PointerEvent<HTMLElement>) {
+    const dragState = dragStateRef.current
+    if (!dragState || dragState.pointerId !== event.pointerId) {
+      return
+    }
+
+    const currentPoint = getSvgPoint(event.clientX, event.clientY, previewRef.current)
+    if (!currentPoint) {
+      return
+    }
+
+    event.preventDefault()
+    event.stopPropagation()
+    dragState.currentPoint = currentPoint
+
+    if (dragState.action === 'move') {
+      setDragPreview({
+        dx: currentPoint.x - dragState.startPoint.x,
+        dy: currentPoint.y - dragState.startPoint.y,
+        scaleX: 1,
+        scaleY: 1,
+        rotation: 0,
+        originX: 50,
+        originY: 50,
+      })
+      return
+    }
+
+    if (dragState.action === 'rotate') {
+      const center = {
+        x: dragState.startBox.x + dragState.startBox.width / 2,
+        y: dragState.startBox.y + dragState.startBox.height / 2,
+      }
+      const startAngle = pointAngle(center, dragState.startPoint)
+      const currentAngle = pointAngle(center, currentPoint)
+      setDragPreview({
+        dx: 0,
+        dy: 0,
+        scaleX: 1,
+        scaleY: 1,
+        rotation: toDegrees(currentAngle - startAngle),
+        originX: 50,
+        originY: 50,
+      })
+      return
+    }
+
+    setDragPreview(resizePreview(dragState.action, dragState.startBox, currentPoint, dragState.uniform))
+  }
+
+  function endSelectionDrag(event: PointerEvent<HTMLElement>) {
+    const dragState = dragStateRef.current
+    if (!dragState || dragState.pointerId !== event.pointerId) {
+      return
+    }
+
+    event.preventDefault()
+    event.stopPropagation()
+    event.currentTarget.releasePointerCapture(event.pointerId)
+    dragStateRef.current = null
+    setDragPreview(null)
+
+    const endPoint = getSvgPoint(event.clientX, event.clientY, previewRef.current) ?? dragState.currentPoint
+    const movedDistance = Math.hypot(endPoint.x - dragState.startPoint.x, endPoint.y - dragState.startPoint.y)
+    if (movedDistance < 0.01) {
+      setStatus('Element selected')
+      return
+    }
+
+    if (dragState.action === 'move') {
+      const dx = endPoint.x - dragState.startPoint.x
+      const dy = endPoint.y - dragState.startPoint.y
+      updateSvg(
+        (current) =>
+          transformSelection(current, dragState.selectedIds, `translate(${dx.toFixed(4)} ${dy.toFixed(4)})`),
+        'Selection moved',
+      )
+      return
+    }
+
+    if (dragState.action === 'rotate') {
+      const center = {
+        x: dragState.startBox.x + dragState.startBox.width / 2,
+        y: dragState.startBox.y + dragState.startBox.height / 2,
+      }
+      const degrees = toDegrees(pointAngle(center, endPoint) - pointAngle(center, dragState.startPoint))
+      updateSvg(
+        (current) =>
+          transformSelection(
+            current,
+            dragState.selectedIds,
+            `rotate(${degrees.toFixed(3)} ${center.x.toFixed(4)} ${center.y.toFixed(4)})`,
+          ),
+        'Selection rotated',
+      )
+      return
+    }
+
+    updateSvg(
+      (current) =>
+        transformSelection(
+          current,
+          dragState.selectedIds,
+          buildResizeTransform(dragState.action, dragState.startBox, endPoint, dragState.uniform),
+        ),
+      dragState.uniform ? 'Selection scaled' : 'Selection resized',
+    )
+  }
+
   function runAutoLayout() {
     try {
       const result = autoLayoutSvg(svgText, previewRef.current, gapMm)
@@ -789,6 +1219,7 @@ function App() {
         normaliseSvg(result.text),
         `${result.placements.length} elements packed into ${result.sheetCount} sheet${result.sheetCount === 1 ? '' : 's'}`,
       )
+      setSelectedIds([])
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Auto layout failed')
     }
@@ -797,6 +1228,7 @@ function App() {
   function resetSample() {
     commitSvg(normaliseSvg(sampleSvg), 'Sample loaded', true)
     setFileName('k40-sample.svg')
+    setSelectedIds([])
   }
 
   function renameLayerItem(id: string, name: string) {
@@ -808,6 +1240,20 @@ function App() {
       (current) => setLayerVisibility(current, id, currentlyHidden),
       currentlyHidden ? 'Layer shown' : 'Layer hidden',
     )
+  }
+
+  function selectLayer(id: string, additive: boolean) {
+    setSelectedIds((current) => {
+      if (!additive) {
+        return [id]
+      }
+
+      return current.includes(id)
+        ? current.filter((selectedId) => selectedId !== id)
+        : [...current, id]
+    })
+    setToolMode('select')
+    setStatus(additive ? 'Selection updated' : 'Layer selected')
   }
 
   return (
@@ -866,6 +1312,13 @@ function App() {
             <div className="segmented">
               <button
                 type="button"
+                className={toolMode === 'select' ? 'active' : ''}
+                onClick={() => setToolMode('select')}
+              >
+                Select
+              </button>
+              <button
+                type="button"
                 className={toolMode === 'measure' ? 'active' : ''}
                 onClick={() => setToolMode('measure')}
               >
@@ -886,6 +1339,20 @@ function App() {
                 Vector cut
               </button>
             </div>
+          </div>
+
+          <div className="panel-section">
+            <h2>Transform</h2>
+            <div className="selection-summary">
+              <span>Selected</span>
+              <strong>{selectedIds.length}</strong>
+            </div>
+            {selectionBox ? (
+              <div className="transform-readout">
+                <span>{formatMm(selectionBox.width * svgInfo.unitX)}</span>
+                <span>{formatMm(selectionBox.height * svgInfo.unitY)}</span>
+              </div>
+            ) : null}
           </div>
 
           <div className="panel-section">
@@ -930,20 +1397,98 @@ function App() {
               ref={previewRef}
               className={`svg-preview mode-${toolMode}`}
               onClick={handlePreviewClick}
+              onPointerDown={handlePreviewPointerDown}
+              onPointerMove={updateSelectionDrag}
+              onPointerUp={endSelectionDrag}
+              onPointerCancel={endSelectionDrag}
               dangerouslySetInnerHTML={{ __html: svgText }}
             />
-            {selectedPoints.map((point, index) => (
-              <span
-                className="measurement-dot"
-                key={`${point.x}-${point.y}-${index}`}
-                style={{
-                  left: `${((point.x - svgInfo.viewBox[0]) / svgInfo.viewBox[2]) * 100}%`,
-                  top: `${((point.y - svgInfo.viewBox[1]) / svgInfo.viewBox[3]) * 100}%`,
-                }}
-              >
-                {index + 1}
-              </span>
-            ))}
+            <div className="preview-overlay">
+              {toolMode === 'select' && selectionBox ? (
+                <span
+                  className="selection-box"
+                  onPointerDown={(event) => beginSelectionDrag(event, 'move')}
+                  onPointerMove={updateSelectionDrag}
+                  onPointerUp={endSelectionDrag}
+                  onPointerCancel={endSelectionDrag}
+                  style={{
+                    left: percentInViewBox(selectionBox.x + (dragPreview?.dx ?? 0), svgInfo.viewBox[0], svgInfo.viewBox[2]),
+                    top: percentInViewBox(selectionBox.y + (dragPreview?.dy ?? 0), svgInfo.viewBox[1], svgInfo.viewBox[3]),
+                    width: `${(selectionBox.width / svgInfo.viewBox[2]) * 100}%`,
+                    height: `${(selectionBox.height / svgInfo.viewBox[3]) * 100}%`,
+                    transform: dragPreview
+                      ? `scale(${dragPreview.scaleX}, ${dragPreview.scaleY}) rotate(${dragPreview.rotation}deg)`
+                      : undefined,
+                    transformOrigin: dragPreview
+                      ? `${dragPreview.originX}% ${dragPreview.originY}%`
+                      : undefined,
+                  }}
+                >
+                  <span
+                    className="resize-handle nw"
+                    role="button"
+                    tabIndex={0}
+                    title="Resize"
+                    onPointerDown={(event) => beginSelectionDrag(event, 'resize-nw')}
+                    onPointerMove={updateSelectionDrag}
+                    onPointerUp={endSelectionDrag}
+                    onPointerCancel={endSelectionDrag}
+                  />
+                  <span
+                    className="resize-handle ne"
+                    role="button"
+                    tabIndex={0}
+                    title="Resize"
+                    onPointerDown={(event) => beginSelectionDrag(event, 'resize-ne')}
+                    onPointerMove={updateSelectionDrag}
+                    onPointerUp={endSelectionDrag}
+                    onPointerCancel={endSelectionDrag}
+                  />
+                  <span
+                    className="resize-handle sw"
+                    role="button"
+                    tabIndex={0}
+                    title="Resize"
+                    onPointerDown={(event) => beginSelectionDrag(event, 'resize-sw')}
+                    onPointerMove={updateSelectionDrag}
+                    onPointerUp={endSelectionDrag}
+                    onPointerCancel={endSelectionDrag}
+                  />
+                  <span
+                    className="resize-handle se"
+                    role="button"
+                    tabIndex={0}
+                    title="Resize"
+                    onPointerDown={(event) => beginSelectionDrag(event, 'resize-se')}
+                    onPointerMove={updateSelectionDrag}
+                    onPointerUp={endSelectionDrag}
+                    onPointerCancel={endSelectionDrag}
+                  />
+                  <span
+                    className="rotate-handle"
+                    role="button"
+                    tabIndex={0}
+                    title="Rotate"
+                    onPointerDown={(event) => beginSelectionDrag(event, 'rotate')}
+                    onPointerMove={updateSelectionDrag}
+                    onPointerUp={endSelectionDrag}
+                    onPointerCancel={endSelectionDrag}
+                  />
+                </span>
+              ) : null}
+              {selectedPoints.map((point, index) => (
+                <span
+                  className="measurement-target"
+                  key={`${point.x}-${point.y}-${index}`}
+                  style={{
+                    left: percentInViewBox(point.x, svgInfo.viewBox[0], svgInfo.viewBox[2]),
+                    top: percentInViewBox(point.y, svgInfo.viewBox[1], svgInfo.viewBox[3]),
+                  }}
+                >
+                  <b>{index + 1}</b>
+                </span>
+              ))}
+            </div>
           </div>
         </section>
 
@@ -952,6 +1497,8 @@ function App() {
             <h2>Layers</h2>
             <LayerTree
               nodes={layers}
+              selectedIds={selectedIds}
+              onSelect={selectLayer}
               onRename={renameLayerItem}
               onToggleVisibility={toggleLayerVisibility}
             />
