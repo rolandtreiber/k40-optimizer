@@ -36,7 +36,7 @@ type Placement = {
   height: number
   placedWidth: number
   placedHeight: number
-  rotation: 0 | 90
+  rotation: number
 }
 
 type HistoryState = {
@@ -57,13 +57,48 @@ type LayerNode = {
 type LayoutPart = {
   id: string
   part: SVGElement
+  previewElement: SVGGraphicsElement
   box: DOMRect
 }
 
 type LayoutCluster = {
   id: string
+  root: LayoutPart
   parts: LayoutPart[]
   box: DOMRect
+}
+
+type MaskVariant = {
+  rotation: number
+  width: number
+  height: number
+  widthCells: number
+  heightCells: number
+  collisionCells: Array<[number, number]>
+  solidCells: Array<[number, number]>
+}
+
+type PackedItem = {
+  id: string
+  cluster: LayoutCluster
+  variants: MaskVariant[]
+  area: number
+}
+
+type SheetState = {
+  occupied: Set<number>
+  placements: Placement[]
+  usedWidth: number
+  usedHeight: number
+  solidCellCount: number
+}
+
+type PackResult = {
+  placements: Placement[]
+  sheetCount: number
+  score: number
+  passes: number
+  timedOut: boolean
 }
 
 type SelectedBox = {
@@ -103,9 +138,14 @@ const GRAPHIC_SELECTOR =
   'path,line,polyline,polygon,rect,circle,ellipse,g,image,use,text'
 const HIT_TEST_SELECTOR =
   'path,line,polyline,polygon,rect,circle,ellipse,image,use,text'
+const LAYOUT_GEOMETRY_SELECTOR =
+  'path,line,polyline,polygon,rect,circle,ellipse'
 const NON_PART_SELECTOR = 'defs,style,title,desc,metadata,symbol,clipPath,mask,pattern'
 const MAX_HISTORY = 80
 const HIT_TOLERANCE_PX = 6
+const AUTO_LAYOUT_TIME_LIMIT_MS = 30_000
+const AUTO_LAYOUT_MAX_PASSES = 160
+const AUTO_LAYOUT_CELL_MM = 2
 
 const sampleSvg = `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="210mm" height="130mm" viewBox="0 0 210 130">
@@ -519,12 +559,6 @@ function getClickableTarget(
   return findNearestClickableTarget(preview, clientX, clientY)
 }
 
-function topLevelParts(svg: SVGSVGElement) {
-  return Array.from(svg.children).filter((child) => {
-    return !child.matches(NON_PART_SELECTOR)
-  }) as SVGElement[]
-}
-
 function getElementBox(preview: HTMLDivElement, id: string) {
   const svg = preview.querySelector('svg') as SVGSVGElement | null
   const element = preview.querySelector(`[data-k40-id="${CSS.escape(id)}"]`) as SVGGraphicsElement | null
@@ -769,134 +803,474 @@ function buildLayoutClusters(parts: LayoutPart[]): LayoutCluster[] {
 
   return Array.from(grouped.entries()).map(([id, clusterParts]) => ({
     id,
+    root: clusterParts.find((part) => part.id === id) ?? clusterParts[0],
     parts: clusterParts,
     box: unionBoxes(clusterParts.map((part) => part.box)),
   }))
 }
 
-function packItems(
-  items: Array<{ id: string; width: number; height: number }>,
-  gap: number,
-) {
-  type CandidatePlacement = {
-    sheet: number
-    x: number
-    y: number
-    placedWidth: number
-    placedHeight: number
-    rotation: 0 | 90
-    score: number
+function isVisibleGraphic(element: SVGElement) {
+  const style = window.getComputedStyle(element)
+  return (
+    style.display !== 'none' &&
+    style.visibility !== 'hidden' &&
+    style.opacity !== '0' &&
+    element.getAttribute('display') !== 'none' &&
+    element.getAttribute('visibility') !== 'hidden'
+  )
+}
+
+function getLayoutParts(text: string, preview: HTMLDivElement) {
+  const source = parseSvg(text)
+  const previewSvg = preview.querySelector('svg') as SVGSVGElement | null
+  if (!previewSvg) {
+    return { source, parts: [] }
   }
 
-  const placements: Placement[] = []
-  const placedBySheet: Array<Array<Placement>> = [[]]
+  const parts = Array.from(previewSvg.querySelectorAll(LAYOUT_GEOMETRY_SELECTOR))
+    .map((element) => element as SVGGraphicsElement)
+    .filter((element) => isVisibleGraphic(element))
+    .map((previewElement) => {
+      const id = previewElement.getAttribute('data-k40-id')
+      const part = id
+        ? source.svg.querySelector(`[data-k40-id="${CSS.escape(id)}"]`) as SVGElement | null
+        : null
+      const box = id ? getElementBox(preview, id) : null
 
-  function overlaps(sheetPlacements: Placement[], x: number, y: number, width: number, height: number) {
-    return sheetPlacements.some((placed) => {
-      return !(
-        x + width + gap <= placed.x ||
-        placed.x + placed.placedWidth + gap <= x ||
-        y + height + gap <= placed.y ||
-        placed.y + placed.placedHeight + gap <= y
-      )
+      if (!id || !part || !box) {
+        return null
+      }
+
+      return { id, part, previewElement, box }
     })
-  }
+    .filter((part): part is LayoutPart => Boolean(part))
 
-  function candidatePositions(sheetPlacements: Placement[]) {
-    const xs = new Set([gap])
-    const ys = new Set([gap])
+  return { source, parts }
+}
 
-    sheetPlacements.forEach((placed) => {
-      xs.add(placed.x + placed.placedWidth + gap)
-      xs.add(placed.x)
-      ys.add(placed.y + placed.placedHeight + gap)
-      ys.add(placed.y)
-    })
+function temporarilyFillForSampling<T>(element: SVGGeometryElement, callback: () => T) {
+  const fill = element.getAttribute('fill')
+  const fillOpacity = element.getAttribute('fill-opacity')
+  element.setAttribute('fill', '#000000')
+  element.setAttribute('fill-opacity', '1')
 
-    return Array.from(xs).flatMap((x) => Array.from(ys).map((y) => ({ x, y })))
-  }
-
-  items.forEach((item) => {
-    let best: CandidatePlacement | null = null
-
-    const orientations: Array<{ placedWidth: number; placedHeight: number; rotation: 0 | 90 }> = [
-      { placedWidth: item.width, placedHeight: item.height, rotation: 0 },
-      { placedWidth: item.height, placedHeight: item.width, rotation: 90 },
-    ]
-
-    for (let sheet = 0; sheet <= placedBySheet.length; sheet += 1) {
-      const sheetPlacements = placedBySheet[sheet] ?? []
-      const candidates = sheetPlacements.length === 0
-        ? [{ x: gap, y: gap }]
-        : candidatePositions(sheetPlacements)
-
-      orientations.forEach((orientation) => {
-        candidates.forEach(({ x, y }) => {
-          if (
-            x + orientation.placedWidth + gap > BED_WIDTH_MM ||
-            y + orientation.placedHeight + gap > BED_HEIGHT_MM ||
-            overlaps(sheetPlacements, x, y, orientation.placedWidth, orientation.placedHeight)
-          ) {
-            return
-          }
-
-          const usedWidth = Math.max(
-            x + orientation.placedWidth,
-            ...sheetPlacements.map((placed) => placed.x + placed.placedWidth),
-          )
-          const usedHeight = Math.max(
-            y + orientation.placedHeight,
-            ...sheetPlacements.map((placed) => placed.y + placed.placedHeight),
-          )
-          const score = sheet * 10_000_000 + usedHeight * 10_000 + usedWidth * 100 + y + x * 0.01
-
-          if (!best || score < best.score) {
-            best = {
-              sheet,
-              x,
-              y,
-              ...orientation,
-              score,
-            }
-          }
-        })
-      })
+  try {
+    return callback()
+  } finally {
+    if (fill === null) {
+      element.removeAttribute('fill')
+    } else {
+      element.setAttribute('fill', fill)
     }
 
-    const bestPlacement = best as CandidatePlacement | null
-    const placement: Placement = bestPlacement
-      ? {
-          id: item.id,
-          sheet: bestPlacement.sheet,
-          x: bestPlacement.x,
-          y: bestPlacement.y,
-          width: item.width,
-          height: item.height,
-          placedWidth: bestPlacement.placedWidth,
-          placedHeight: bestPlacement.placedHeight,
-          rotation: bestPlacement.rotation,
-        }
-      : {
-          id: item.id,
-          sheet: placedBySheet.length,
-          x: gap,
-          y: gap,
-          width: item.width,
-          height: item.height,
-          placedWidth: item.width,
-          placedHeight: item.height,
-          rotation: 0,
-        }
+    if (fillOpacity === null) {
+      element.removeAttribute('fill-opacity')
+    } else {
+      element.setAttribute('fill-opacity', fillOpacity)
+    }
+  }
+}
 
-    if (!placedBySheet[placement.sheet]) {
-      placedBySheet[placement.sheet] = []
+function fullRectCells(widthCells: number, heightCells: number) {
+  return Array.from({ length: widthCells * heightCells }, (_, index) => [
+    index % widthCells,
+    Math.floor(index / widthCells),
+  ] as [number, number])
+}
+
+function clusterMaskCells(cluster: LayoutCluster, sourceInfo: SvgInfo, cellMm: number) {
+  const root = cluster.root.previewElement
+  const width = cluster.box.width * sourceInfo.unitX
+  const height = cluster.box.height * sourceInfo.unitY
+  const widthCells = Math.max(1, Math.ceil(width / cellMm))
+  const heightCells = Math.max(1, Math.ceil(height / cellMm))
+  const svg = root.ownerSVGElement
+  const ctm = root.getCTM()
+
+  if (!(root instanceof SVGGeometryElement) || !svg || !ctm) {
+    return { width, height, cells: fullRectCells(widthCells, heightCells) }
+  }
+
+  const inverse = ctm.inverse()
+  const cells = temporarilyFillForSampling(root, () => {
+    const sampled: Array<[number, number]> = []
+
+    for (let y = 0; y < heightCells; y += 1) {
+      for (let x = 0; x < widthCells; x += 1) {
+        const point = svg.createSVGPoint()
+        point.x = cluster.box.x + ((x + 0.5) * cellMm) / sourceInfo.unitX
+        point.y = cluster.box.y + ((y + 0.5) * cellMm) / sourceInfo.unitY
+        const localPoint = point.matrixTransform(inverse)
+
+        if (root.isPointInFill(localPoint) || root.isPointInStroke(localPoint)) {
+          sampled.push([x, y])
+        }
+      }
     }
 
-    placedBySheet[placement.sheet].push(placement)
-    placements.push(placement)
+    return sampled
   })
 
-  return placements
+  return { width, height, cells: cells.length > 0 ? cells : fullRectCells(widthCells, heightCells) }
+}
+
+function rotateCells(cells: Array<[number, number]>, width: number, height: number, rotation: number, cellMm: number) {
+  const radians = (rotation * Math.PI) / 180
+  const cos = Math.cos(radians)
+  const sin = Math.sin(radians)
+  const center = { x: width / 2, y: height / 2 }
+  const corners = [
+    { x: 0, y: 0 },
+    { x: width, y: 0 },
+    { x: width, y: height },
+    { x: 0, y: height },
+  ].map((corner) => {
+    const dx = corner.x - center.x
+    const dy = corner.y - center.y
+    return {
+      x: center.x + dx * cos - dy * sin,
+      y: center.y + dx * sin + dy * cos,
+    }
+  })
+  const minX = Math.min(...corners.map((point) => point.x))
+  const minY = Math.min(...corners.map((point) => point.y))
+  const maxX = Math.max(...corners.map((point) => point.x))
+  const maxY = Math.max(...corners.map((point) => point.y))
+  const solid = new Set<string>()
+
+  cells.forEach(([cellX, cellY]) => {
+    const x = (cellX + 0.5) * cellMm
+    const y = (cellY + 0.5) * cellMm
+    const dx = x - center.x
+    const dy = y - center.y
+    const rotatedX = center.x + dx * cos - dy * sin
+    const rotatedY = center.y + dx * sin + dy * cos
+    solid.add(`${Math.max(0, Math.floor((rotatedX - minX) / cellMm))},${Math.max(0, Math.floor((rotatedY - minY) / cellMm))}`)
+  })
+
+  return {
+    rotation,
+    width: maxX - minX,
+    height: maxY - minY,
+    widthCells: Math.max(1, Math.ceil((maxX - minX) / cellMm)),
+    heightCells: Math.max(1, Math.ceil((maxY - minY) / cellMm)),
+    solidCells: Array.from(solid).map((key) => key.split(',').map(Number) as [number, number]),
+  }
+}
+
+function inflateCells(cells: Array<[number, number]>, gapCells: number) {
+  if (gapCells <= 0) {
+    return cells
+  }
+
+  const inflated = new Set<string>()
+  cells.forEach(([cellX, cellY]) => {
+    for (let y = -gapCells; y <= gapCells; y += 1) {
+      for (let x = -gapCells; x <= gapCells; x += 1) {
+        if (Math.hypot(x, y) <= gapCells) {
+          inflated.add(`${cellX + x},${cellY + y}`)
+        }
+      }
+    }
+  })
+
+  return Array.from(inflated).map((key) => key.split(',').map(Number) as [number, number])
+}
+
+function buildPackedItems(clusters: LayoutCluster[], sourceInfo: SvgInfo, gapMm: number): PackedItem[] {
+  const gapCells = Math.max(0, Math.ceil(gapMm / AUTO_LAYOUT_CELL_MM))
+  const rotations = [0, 90, 180, 270, 30, 60, 120, 150, 210, 240, 300, 330, 45, 135, 225, 315]
+
+  return clusters.map((cluster) => {
+    const mask = clusterMaskCells(cluster, sourceInfo, AUTO_LAYOUT_CELL_MM)
+    const variants = rotations.map((rotation) => {
+      const rotated = rotateCells(mask.cells, mask.width, mask.height, rotation, AUTO_LAYOUT_CELL_MM)
+      return {
+        ...rotated,
+        collisionCells: inflateCells(rotated.solidCells, gapCells),
+      }
+    })
+
+    return {
+      id: cluster.id,
+      cluster,
+      variants,
+      area: mask.cells.length * AUTO_LAYOUT_CELL_MM * AUTO_LAYOUT_CELL_MM,
+    }
+  })
+}
+
+function placementKey(cellX: number, cellY: number, bedWidthCells: number) {
+  return cellY * bedWidthCells + cellX
+}
+
+function canPlaceVariant(sheet: SheetState, variant: MaskVariant, xCell: number, yCell: number, bedWidthCells: number, bedHeightCells: number) {
+  for (const [cellX, cellY] of variant.collisionCells) {
+    const absoluteX = xCell + cellX
+    const absoluteY = yCell + cellY
+
+    if (
+      absoluteX < 0 ||
+      absoluteY < 0 ||
+      absoluteX >= bedWidthCells ||
+      absoluteY >= bedHeightCells ||
+      sheet.occupied.has(placementKey(absoluteX, absoluteY, bedWidthCells))
+    ) {
+      return false
+    }
+  }
+
+  return true
+}
+
+function collisionBounds(variant: MaskVariant) {
+  return {
+    minX: Math.min(...variant.collisionCells.map(([x]) => x)),
+    maxX: Math.max(...variant.collisionCells.map(([x]) => x)),
+    minY: Math.min(...variant.collisionCells.map(([, y]) => y)),
+    maxY: Math.max(...variant.collisionCells.map(([, y]) => y)),
+  }
+}
+
+function edgeCandidate(variant: MaskVariant, bedWidthCells: number, bedHeightCells: number) {
+  const bounds = collisionBounds(variant)
+  return {
+    x: Math.max(0, -bounds.minX),
+    y: Math.max(0, -bounds.minY),
+    maxX: Math.max(0, bedWidthCells - 1 - bounds.maxX),
+    maxY: Math.max(0, bedHeightCells - 1 - bounds.maxY),
+  }
+}
+
+function placeVariant(sheet: SheetState, item: PackedItem, variant: MaskVariant, sheetIndex: number, xCell: number, yCell: number, bedWidthCells: number) {
+  variant.collisionCells.forEach(([cellX, cellY]) => {
+    sheet.occupied.add(placementKey(xCell + cellX, yCell + cellY, bedWidthCells))
+  })
+  sheet.solidCellCount += variant.solidCells.length
+  sheet.usedWidth = Math.max(sheet.usedWidth, xCell * AUTO_LAYOUT_CELL_MM + variant.width)
+  sheet.usedHeight = Math.max(sheet.usedHeight, yCell * AUTO_LAYOUT_CELL_MM + variant.height)
+
+  const placement = {
+    id: item.id,
+    sheet: sheetIndex,
+    x: xCell * AUTO_LAYOUT_CELL_MM,
+    y: yCell * AUTO_LAYOUT_CELL_MM,
+    width: item.cluster.box.width,
+    height: item.cluster.box.height,
+    placedWidth: variant.width,
+    placedHeight: variant.height,
+    rotation: variant.rotation,
+  }
+  sheet.placements.push(placement)
+  return placement
+}
+
+function seedNoise(pass: number, itemIndex: number, offset: number) {
+  const value = Math.sin((pass + 1) * 12.9898 + (itemIndex + 1) * 78.233 + offset * 37.719) * 43758.5453
+  return value - Math.floor(value)
+}
+
+function candidateCells(sheet: SheetState, variant: MaskVariant, pass: number, itemIndex: number, bedWidthCells: number, bedHeightCells: number) {
+  const edges = edgeCandidate(variant, bedWidthCells, bedHeightCells)
+  const minX = edges.x
+  const minY = edges.y
+  const maxX = Math.max(minX, edges.maxX)
+  const maxY = Math.max(minY, edges.maxY)
+  const xPositions = new Set([minX, maxX])
+  const yPositions = new Set([minY, maxY])
+
+  sheet.placements.forEach((placement) => {
+    const left = Math.round(placement.x / AUTO_LAYOUT_CELL_MM)
+    const top = Math.round(placement.y / AUTO_LAYOUT_CELL_MM)
+    const right = Math.round((placement.x + placement.placedWidth) / AUTO_LAYOUT_CELL_MM)
+    const bottom = Math.round((placement.y + placement.placedHeight) / AUTO_LAYOUT_CELL_MM)
+    const centerX = Math.round((left + right - variant.widthCells) / 2)
+    const centerY = Math.round((top + bottom - variant.heightCells) / 2)
+
+    ;[left, right, right - variant.widthCells, left - variant.widthCells, centerX, left + Math.round(variant.widthCells / 2), right - Math.round(variant.widthCells / 2)]
+      .forEach((x) => xPositions.add(Math.max(minX, Math.min(maxX, x))))
+    ;[top, bottom, bottom - variant.heightCells, top - variant.heightCells, centerY, top + Math.round(variant.heightCells / 2), bottom - Math.round(variant.heightCells / 2)]
+      .forEach((y) => yPositions.add(Math.max(minY, Math.min(maxY, y))))
+  })
+
+  const stride = pass % 5 === 0 ? 6 : 9
+  for (let y = minY; y <= maxY; y += stride) {
+    yPositions.add(y)
+  }
+  for (let x = minX; x <= maxX; x += stride) {
+    xPositions.add(x)
+  }
+
+  for (let i = 0; i < 12; i += 1) {
+    xPositions.add(minX + Math.floor(seedNoise(pass, itemIndex, i) * (maxX - minX + 1)))
+    yPositions.add(minY + Math.floor(seedNoise(pass + 17, itemIndex, i) * (maxY - minY + 1)))
+  }
+
+  return Array.from(yPositions)
+    .flatMap((y) => Array.from(xPositions).map((x) => ({ x, y })))
+    .sort((a, b) => a.y - b.y || a.x - b.x)
+    .slice(0, 360)
+}
+
+function orderItems(items: PackedItem[], pass: number) {
+  const ordered = [...items]
+  const mode = pass % 6
+
+  if (mode === 0) {
+    ordered.sort((a, b) => b.area - a.area)
+  } else if (mode === 1) {
+    ordered.sort((a, b) => b.cluster.box.height - a.cluster.box.height)
+  } else if (mode === 2) {
+    ordered.sort((a, b) => b.cluster.box.width - a.cluster.box.width)
+  } else if (mode === 3) {
+    ordered.sort((a, b) => Math.max(b.cluster.box.width, b.cluster.box.height) - Math.max(a.cluster.box.width, a.cluster.box.height))
+  } else {
+    ordered.sort((a, b) => seedNoise(pass, Number(a.id.replace(/\D/g, '')) || 0, 0) - seedNoise(pass, Number(b.id.replace(/\D/g, '')) || 0, 0))
+  }
+
+  return ordered
+}
+
+function scoreSheets(sheets: SheetState[]) {
+  const usedSheets = sheets.filter((sheet) => sheet.placements.length > 0)
+  const totalUsedArea = usedSheets.reduce((sum, sheet) => sum + sheet.usedWidth * sheet.usedHeight, 0)
+  const totalUsedHeight = usedSheets.reduce((sum, sheet) => sum + sheet.usedHeight, 0)
+  const totalUsedWidth = usedSheets.reduce((sum, sheet) => sum + sheet.usedWidth, 0)
+  const materialArea = usedSheets.reduce((sum, sheet) => sum + sheet.solidCellCount * AUTO_LAYOUT_CELL_MM * AUTO_LAYOUT_CELL_MM, 0)
+  const negativeSpace = Math.max(0, totalUsedArea - materialArea)
+
+  return usedSheets.length * 1_000_000_000 + totalUsedArea * 10_000 + negativeSpace * 100 + totalUsedHeight * 10 + totalUsedWidth
+}
+
+function packItems(items: PackedItem[], startedAt: number) {
+  const bedWidthCells = Math.floor(BED_WIDTH_MM / AUTO_LAYOUT_CELL_MM)
+  const bedHeightCells = Math.floor(BED_HEIGHT_MM / AUTO_LAYOUT_CELL_MM)
+  const seen = new Set<string>()
+  let best: PackResult | null = null
+  let timedOut = false
+  let passes = 0
+  let passesSinceImprovement = 0
+  const minPasses = Math.min(50, 6 + items.length)
+  const stallLimit = Math.min(30, 6 + Math.ceil(items.length / 2))
+
+  for (let pass = 0; pass < AUTO_LAYOUT_MAX_PASSES; pass += 1) {
+    if (performance.now() - startedAt > AUTO_LAYOUT_TIME_LIMIT_MS) {
+      timedOut = true
+      break
+    }
+
+    if (pass >= minPasses && passesSinceImprovement >= stallLimit) {
+      break
+    }
+
+    const sheets: SheetState[] = [{ occupied: new Set(), placements: [], usedWidth: 0, usedHeight: 0, solidCellCount: 0 }]
+
+    orderItems(items, pass).forEach((item, itemIndex) => {
+      let bestCandidate: { sheetIndex: number; variant: MaskVariant; xCell: number; yCell: number; score: number } | null = null
+      const variants = pass % 2 === 0
+        ? item.variants
+        : [...item.variants].sort((a, b) => seedNoise(pass, itemIndex, a.rotation) - seedNoise(pass, itemIndex, b.rotation))
+
+      for (let sheetIndex = 0; sheetIndex <= sheets.length; sheetIndex += 1) {
+        const sheet = sheets[sheetIndex] ?? { occupied: new Set(), placements: [], usedWidth: 0, usedHeight: 0, solidCellCount: 0 }
+
+        for (const variant of variants) {
+          if (variant.widthCells > bedWidthCells || variant.heightCells > bedHeightCells) {
+            continue
+          }
+
+          const candidates = sheet.placements.length === 0
+            ? [edgeCandidate(variant, bedWidthCells, bedHeightCells)]
+            : candidateCells(sheet, variant, pass, itemIndex, bedWidthCells, bedHeightCells)
+
+          for (const candidate of candidates) {
+            if (!canPlaceVariant(sheet, variant, candidate.x, candidate.y, bedWidthCells, bedHeightCells)) {
+              continue
+            }
+
+            const usedWidth = Math.max(sheet.usedWidth, candidate.x * AUTO_LAYOUT_CELL_MM + variant.width)
+            const usedHeight = Math.max(sheet.usedHeight, candidate.y * AUTO_LAYOUT_CELL_MM + variant.height)
+            const localScore = sheetIndex * 1_000_000_000 + usedWidth * usedHeight * 10_000 + usedHeight * 100 + usedWidth + candidate.y * 0.1 + candidate.x * 0.01
+
+            if (!bestCandidate || localScore < bestCandidate.score) {
+              bestCandidate = { sheetIndex, variant, xCell: candidate.x, yCell: candidate.y, score: localScore }
+            }
+          }
+        }
+      }
+
+      if (bestCandidate) {
+        if (!sheets[bestCandidate.sheetIndex]) {
+          sheets[bestCandidate.sheetIndex] = { occupied: new Set(), placements: [], usedWidth: 0, usedHeight: 0, solidCellCount: 0 }
+        }
+        placeVariant(sheets[bestCandidate.sheetIndex], item, bestCandidate.variant, bestCandidate.sheetIndex, bestCandidate.xCell, bestCandidate.yCell, bedWidthCells)
+      }
+    })
+
+    const placements = sheets.flatMap((sheet) => sheet.placements)
+    const signature = placements
+      .map((placement) => `${placement.id}:${placement.sheet}:${Math.round(placement.x)}:${Math.round(placement.y)}:${placement.rotation}`)
+      .sort()
+      .join('|')
+
+    if (!seen.has(signature)) {
+      seen.add(signature)
+      const score = scoreSheets(sheets)
+      const sheetCount = sheets.filter((sheet) => sheet.placements.length > 0).length
+      passes = pass + 1
+
+      if (!best || score < best.score) {
+        best = { placements, sheetCount, score, passes, timedOut: false }
+        passesSinceImprovement = 0
+      } else {
+        passesSinceImprovement += 1
+      }
+    } else {
+      passesSinceImprovement += 1
+    }
+  }
+
+  if (!best) {
+    throw new Error('No valid packed layout could be found.')
+  }
+
+  return { ...best, timedOut, passes }
+}
+
+function rotatedBoxMinimum(box: DOMRect, sourceInfo: SvgInfo, rotation: number) {
+  const radians = (rotation * Math.PI) / 180
+  const cos = Math.cos(radians)
+  const sin = Math.sin(radians)
+  const corners = [
+    { x: box.x * sourceInfo.unitX, y: box.y * sourceInfo.unitY },
+    { x: (box.x + box.width) * sourceInfo.unitX, y: box.y * sourceInfo.unitY },
+    { x: (box.x + box.width) * sourceInfo.unitX, y: (box.y + box.height) * sourceInfo.unitY },
+    { x: box.x * sourceInfo.unitX, y: (box.y + box.height) * sourceInfo.unitY },
+  ]
+  const center = { x: (box.x + box.width / 2) * sourceInfo.unitX, y: (box.y + box.height / 2) * sourceInfo.unitY }
+  const rotated = corners.map((corner) => {
+    const dx = corner.x - center.x
+    const dy = corner.y - center.y
+    return { x: center.x + dx * cos - dy * sin, y: center.y + dx * sin + dy * cos }
+  })
+
+  return {
+    x: Math.min(...rotated.map((corner) => corner.x)),
+    y: Math.min(...rotated.map((corner) => corner.y)),
+    center,
+  }
+}
+
+function cloneAbsolutePart(output: Document, part: LayoutPart) {
+  const clone = output.importNode(part.part, true) as SVGElement
+  const ctm = part.previewElement.getCTM()
+
+  if (ctm) {
+    clone.removeAttribute('transform')
+    clone.setAttribute('transform', matrixToString(domMatrixFromSvgMatrix(ctm)))
+  }
+
+  return clone
 }
 
 function autoLayoutSvg(text: string, preview: HTMLDivElement | null, gapMm: number) {
@@ -904,90 +1278,64 @@ function autoLayoutSvg(text: string, preview: HTMLDivElement | null, gapMm: numb
     throw new Error('The preview is not ready yet.')
   }
 
-  const source = parseSvg(text)
+  const startedAt = performance.now()
+  const { source, parts } = getLayoutParts(text, preview)
   const sourceInfo = getSvgInfo(text)
-  const sourceParts = topLevelParts(source.svg)
-    .filter((part) => part.getAttribute('display') !== 'none' && part.getAttribute('visibility') !== 'hidden')
-    .map((part, index) => {
-      const id = part.getAttribute('data-k40-id') ?? `part-${index}`
-      part.setAttribute('data-k40-id', id)
-      const box = getElementBox(preview, id)
-      return { id, part, box }
-    })
+  const clusters = buildLayoutClusters(parts)
+  const packedItems = buildPackedItems(clusters, sourceInfo, gapMm)
 
-  const layoutParts = sourceParts.filter(
-    (item): item is LayoutPart => Boolean(item.box),
-  )
-  const clusters = buildLayoutClusters(layoutParts)
-  const packedParts = clusters
-    .map((cluster) => ({
-      id: cluster.id,
-      width: cluster.box.width * sourceInfo.unitX,
-      height: cluster.box.height * sourceInfo.unitY,
-    }))
-    .sort((a, b) => b.height * b.width - a.height * a.width)
-
-  if (packedParts.length === 0) {
-    throw new Error('No movable SVG elements were found.')
+  if (packedItems.length === 0) {
+    throw new Error('No movable SVG cut outlines were found.')
   }
 
-  const placements = packItems(packedParts, gapMm)
-  const sheetCount = Math.max(...placements.map((placement) => placement.sheet)) + 1
+  const result = packItems(packedItems, startedAt)
   const output = document.implementation.createDocument('http://www.w3.org/2000/svg', 'svg')
   const outputSvg = output.documentElement as unknown as SVGSVGElement
   outputSvg.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
   outputSvg.setAttribute('width', `${BED_WIDTH_MM}mm`)
-  outputSvg.setAttribute('height', `${BED_HEIGHT_MM * sheetCount}mm`)
-  outputSvg.setAttribute('viewBox', `0 0 ${BED_WIDTH_MM} ${BED_HEIGHT_MM * sheetCount}`)
+  outputSvg.setAttribute('height', `${BED_HEIGHT_MM * result.sheetCount}mm`)
+  outputSvg.setAttribute('viewBox', `0 0 ${BED_WIDTH_MM} ${BED_HEIGHT_MM * result.sheetCount}`)
 
   source.svg.querySelectorAll('defs,style').forEach((node) => {
     outputSvg.appendChild(output.importNode(node, true))
   })
 
-  for (let sheetIndex = 0; sheetIndex < sheetCount; sheetIndex += 1) {
+  for (let sheetIndex = 0; sheetIndex < result.sheetCount; sheetIndex += 1) {
     const group = output.createElementNS('http://www.w3.org/2000/svg', 'g')
     group.setAttribute('id', `sheet-${sheetIndex + 1}`)
     group.setAttribute('data-k40-sheet', String(sheetIndex + 1))
     outputSvg.appendChild(group)
   }
 
-  placements.forEach((placement) => {
+  result.placements.forEach((placement) => {
     const cluster = clusters.find((item) => item.id === placement.id)
-    if (!cluster) {
-      return
-    }
-
     const sheetGroup = outputSvg.querySelector(`#sheet-${placement.sheet + 1}`)
-    if (!sheetGroup) {
+    if (!cluster || !sheetGroup) {
       return
     }
 
     const wrapper = output.createElementNS('http://www.w3.org/2000/svg', 'g')
-    const box = cluster.box
+    const rotatedMinimum = rotatedBoxMinimum(cluster.box, sourceInfo, placement.rotation)
     const targetY = placement.sheet * BED_HEIGHT_MM + placement.y
-    const transform = placement.rotation === 90
-      ? [
-          `translate(${(placement.x + box.height * sourceInfo.unitY).toFixed(4)} ${targetY.toFixed(4)})`,
-          'rotate(90)',
-          `translate(${(-box.x * sourceInfo.unitX).toFixed(4)} ${(-box.y * sourceInfo.unitY).toFixed(4)})`,
-          `scale(${sourceInfo.unitX.toFixed(6)} ${sourceInfo.unitY.toFixed(6)})`,
-        ].join(' ')
-      : [
-          `translate(${(placement.x - box.x * sourceInfo.unitX).toFixed(4)} ${(targetY - box.y * sourceInfo.unitY).toFixed(4)})`,
-          `scale(${sourceInfo.unitX.toFixed(6)} ${sourceInfo.unitY.toFixed(6)})`,
-        ].join(' ')
+    const transform = [
+      `translate(${(placement.x - rotatedMinimum.x).toFixed(4)} ${(targetY - rotatedMinimum.y).toFixed(4)})`,
+      `rotate(${placement.rotation.toFixed(4)} ${rotatedMinimum.center.x.toFixed(4)} ${rotatedMinimum.center.y.toFixed(4)})`,
+      `scale(${sourceInfo.unitX.toFixed(6)} ${sourceInfo.unitY.toFixed(6)})`,
+    ].join(' ')
 
     wrapper.setAttribute('transform', transform)
     cluster.parts.forEach((sourcePart) => {
-      wrapper.appendChild(output.importNode(sourcePart.part, true))
+      wrapper.appendChild(cloneAbsolutePart(output, sourcePart))
     })
     sheetGroup.appendChild(wrapper)
   })
 
   return {
     text: serializeSvg(output),
-    sheetCount,
-    placements,
+    sheetCount: result.sheetCount,
+    placements: result.placements,
+    passes: result.passes,
+    timedOut: result.timedOut,
   }
 }
 
