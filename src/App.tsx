@@ -204,6 +204,54 @@ function cleanSvgDocument(doc: Document) {
   })
 }
 
+function hasSheetGroups(svg: SVGSVGElement) {
+  return svg.querySelector(':scope > g[data-k40-sheet]') !== null
+}
+
+function prependTransform(element: Element, transform: string) {
+  const existingTransform = element.getAttribute('transform')
+  element.setAttribute(
+    'transform',
+    existingTransform ? `${transform} ${existingTransform}` : transform,
+  )
+}
+
+function frameArtworkOnBed(svg: SVGSVGElement, sourceViewBox: [number, number, number, number]) {
+  const sourceWidthMm = parseLengthToMm(svg.getAttribute('width'), sourceViewBox[2])
+  const sourceHeightMm = parseLengthToMm(svg.getAttribute('height'), sourceViewBox[3])
+  const unitX = sourceWidthMm / sourceViewBox[2]
+  const unitY = sourceHeightMm / sourceViewBox[3]
+  const isAlreadyBedFramed =
+    sourceViewBox[0] === 0 &&
+    sourceViewBox[1] === 0 &&
+    sourceViewBox[2] === BED_WIDTH_MM &&
+    sourceViewBox[3] === BED_HEIGHT_MM &&
+    sourceWidthMm === BED_WIDTH_MM &&
+    sourceHeightMm === BED_HEIGHT_MM
+
+  if (!isAlreadyBedFramed) {
+    const toMillimetres = [
+      `translate(${(-sourceViewBox[0] * unitX).toFixed(6)} ${(-sourceViewBox[1] * unitY).toFixed(6)})`,
+      `scale(${unitX.toFixed(6)} ${unitY.toFixed(6)})`,
+    ].join(' ')
+
+    Array.from(svg.childNodes).forEach((node) => {
+      if (node.nodeType !== Node.ELEMENT_NODE) {
+        return
+      }
+
+      const element = node as Element
+      if (!element.matches(NON_PART_SELECTOR)) {
+        prependTransform(element, toMillimetres)
+      }
+    })
+  }
+
+  svg.setAttribute('viewBox', `0 0 ${BED_WIDTH_MM} ${BED_HEIGHT_MM}`)
+  svg.setAttribute('width', `${BED_WIDTH_MM}mm`)
+  svg.setAttribute('height', `${BED_HEIGHT_MM}mm`)
+}
+
 function normaliseSvg(text: string) {
   const { doc, svg } = parseSvg(text)
   cleanSvgDocument(doc)
@@ -213,9 +261,13 @@ function normaliseSvg(text: string) {
   }
 
   const viewBox = readViewBox(svg)
-  svg.setAttribute('viewBox', viewBox.join(' '))
-  svg.setAttribute('width', `${parseLengthToMm(svg.getAttribute('width'), viewBox[2]).toFixed(3)}mm`)
-  svg.setAttribute('height', `${parseLengthToMm(svg.getAttribute('height'), viewBox[3]).toFixed(3)}mm`)
+  if (hasSheetGroups(svg)) {
+    svg.setAttribute('viewBox', viewBox.join(' '))
+    svg.setAttribute('width', `${parseLengthToMm(svg.getAttribute('width'), viewBox[2]).toFixed(3)}mm`)
+    svg.setAttribute('height', `${parseLengthToMm(svg.getAttribute('height'), viewBox[3]).toFixed(3)}mm`)
+  } else {
+    frameArtworkOnBed(svg, viewBox)
+  }
 
   let nextId = 1
   svg.querySelectorAll(GRAPHIC_SELECTOR).forEach((element) => {
@@ -257,7 +309,12 @@ function getLayerTree(text: string): LayerNode[] {
       .map(toNode)
       .filter((node): node is LayerNode => Boolean(node))
     const name = element.getAttribute('data-k40-name') || element.getAttribute('id') || tag
-    const hidden = element.getAttribute('display') === 'none' || element.getAttribute('visibility') === 'hidden'
+    const style = element.getAttribute('style') ?? ''
+    const hidden =
+      element.getAttribute('display') === 'none' ||
+      element.getAttribute('visibility') === 'hidden' ||
+      /(?:^|;)\s*display\s*:\s*none\s*(?:;|$)/i.test(style) ||
+      /(?:^|;)\s*visibility\s*:\s*hidden\s*(?:;|$)/i.test(style)
 
     return {
       id,
