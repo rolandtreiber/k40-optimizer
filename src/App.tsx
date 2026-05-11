@@ -27,6 +27,33 @@ type Placement = {
   height: number
 }
 
+type HistoryState = {
+  past: string[]
+  present: string
+  future: string[]
+}
+
+type LayerNode = {
+  id: string
+  elementId: string
+  name: string
+  tag: string
+  hidden: boolean
+  children: LayerNode[]
+}
+
+type LayoutPart = {
+  id: string
+  part: SVGElement
+  box: DOMRect
+}
+
+type LayoutCluster = {
+  id: string
+  parts: LayoutPart[]
+  box: DOMRect
+}
+
 const BED_WIDTH_MM = 300
 const BED_HEIGHT_MM = 200
 const CUT_RED = 'rgb(255, 0, 0)'
@@ -34,6 +61,7 @@ const ENGRAVE_BLUE = 'rgb(0, 0, 255)'
 const GRAPHIC_SELECTOR =
   'path,line,polyline,polygon,rect,circle,ellipse,g,image,use,text'
 const NON_PART_SELECTOR = 'defs,style,title,desc,metadata,symbol,clipPath,mask,pattern'
+const MAX_HISTORY = 80
 
 const sampleSvg = `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="210mm" height="130mm" viewBox="0 0 210 130">
@@ -150,7 +178,109 @@ function normaliseSvg(text: string) {
       element.setAttribute('data-k40-id', `k40-${nextId}`)
       nextId += 1
     }
+
+    if (!element.getAttribute('data-k40-name')) {
+      const id = element.getAttribute('id')
+      element.setAttribute('data-k40-name', id || element.nodeName.toLowerCase())
+    }
   })
+
+  return serializeSvg(doc)
+}
+
+function getSheetCount(text: string) {
+  const { svg } = parseSvg(text)
+  const sheets = svg.querySelectorAll(':scope > g[data-k40-sheet]').length
+  return Math.max(1, sheets)
+}
+
+function getLayerTree(text: string): LayerNode[] {
+  const { svg } = parseSvg(text)
+
+  function toNode(element: Element): LayerNode | null {
+    if (!element.matches(GRAPHIC_SELECTOR)) {
+      return null
+    }
+
+    const id = element.getAttribute('data-k40-id')
+    if (!id) {
+      return null
+    }
+
+    const tag = element.nodeName.toLowerCase()
+    const children = Array.from(element.children)
+      .map(toNode)
+      .filter((node): node is LayerNode => Boolean(node))
+    const name = element.getAttribute('data-k40-name') || element.getAttribute('id') || tag
+    const hidden = element.getAttribute('display') === 'none' || element.getAttribute('visibility') === 'hidden'
+
+    return {
+      id,
+      elementId: element.getAttribute('id') || '',
+      name,
+      tag,
+      hidden,
+      children,
+    }
+  }
+
+  return Array.from(svg.children)
+    .filter((child) => !child.matches(NON_PART_SELECTOR))
+    .map(toNode)
+    .filter((node): node is LayerNode => Boolean(node))
+}
+
+function slugifyId(value: string, fallback: string) {
+  const slug = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return slug || fallback
+}
+
+function uniqueElementId(doc: Document, requested: string, currentElement: Element) {
+  let candidate = requested
+  let suffix = 2
+
+  while (true) {
+    const existing = doc.getElementById(candidate)
+    if (!existing || existing === currentElement) {
+      return candidate
+    }
+
+    candidate = `${requested}-${suffix}`
+    suffix += 1
+  }
+}
+
+function renameLayer(text: string, k40Id: string, name: string) {
+  const { doc } = parseSvg(text)
+  const element = doc.querySelector(`[data-k40-id="${CSS.escape(k40Id)}"]`) as SVGElement | null
+  if (!element) {
+    return text
+  }
+
+  const nextName = name.trim() || element.nodeName.toLowerCase()
+  element.setAttribute('data-k40-name', nextName)
+  element.setAttribute('id', uniqueElementId(doc, slugifyId(nextName, k40Id), element))
+  return serializeSvg(doc)
+}
+
+function setLayerVisibility(text: string, k40Id: string, visible: boolean) {
+  const { doc } = parseSvg(text)
+  const element = doc.querySelector(`[data-k40-id="${CSS.escape(k40Id)}"]`) as SVGElement | null
+  if (!element) {
+    return text
+  }
+
+  if (visible) {
+    element.removeAttribute('display')
+    element.removeAttribute('data-k40-hidden')
+  } else {
+    element.setAttribute('display', 'none')
+    element.setAttribute('data-k40-hidden', 'true')
+  }
 
   return serializeSvg(doc)
 }
@@ -257,6 +387,64 @@ function getElementBox(preview: HTMLDivElement, id: string) {
   }
 }
 
+function containsBox(outer: DOMRect, inner: DOMRect) {
+  const tolerance = 0.001
+  return (
+    outer !== inner &&
+    inner.x >= outer.x - tolerance &&
+    inner.y >= outer.y - tolerance &&
+    inner.x + inner.width <= outer.x + outer.width + tolerance &&
+    inner.y + inner.height <= outer.y + outer.height + tolerance
+  )
+}
+
+function unionBoxes(boxes: DOMRect[]) {
+  const minX = Math.min(...boxes.map((box) => box.x))
+  const minY = Math.min(...boxes.map((box) => box.y))
+  const maxX = Math.max(...boxes.map((box) => box.x + box.width))
+  const maxY = Math.max(...boxes.map((box) => box.y + box.height))
+  return new DOMRect(minX, minY, maxX - minX, maxY - minY)
+}
+
+function buildLayoutClusters(parts: LayoutPart[]): LayoutCluster[] {
+  const parentById = new Map<string, string>()
+
+  parts.forEach((part) => {
+    const containers = parts
+      .filter((candidate) => candidate.id !== part.id && containsBox(candidate.box, part.box))
+      .sort((a, b) => a.box.width * a.box.height - b.box.width * b.box.height)
+
+    const parent = containers[0]
+    if (parent) {
+      parentById.set(part.id, parent.id)
+    }
+  })
+
+  function rootFor(part: LayoutPart) {
+    let rootId = part.id
+    const seen = new Set<string>()
+
+    while (parentById.has(rootId) && !seen.has(rootId)) {
+      seen.add(rootId)
+      rootId = parentById.get(rootId)!
+    }
+
+    return rootId
+  }
+
+  const grouped = new Map<string, LayoutPart[]>()
+  parts.forEach((part) => {
+    const rootId = rootFor(part)
+    grouped.set(rootId, [...(grouped.get(rootId) ?? []), part])
+  })
+
+  return Array.from(grouped.entries()).map(([id, clusterParts]) => ({
+    id,
+    parts: clusterParts,
+    box: unionBoxes(clusterParts.map((part) => part.box)),
+  }))
+}
+
 function packItems(
   items: Array<{ id: string; width: number; height: number }>,
   gap: number,
@@ -307,19 +495,24 @@ function autoLayoutSvg(text: string, preview: HTMLDivElement | null, gapMm: numb
 
   const source = parseSvg(text)
   const sourceInfo = getSvgInfo(text)
-  const sourceParts = topLevelParts(source.svg).map((part, index) => {
-    const id = part.getAttribute('data-k40-id') ?? `part-${index}`
-    part.setAttribute('data-k40-id', id)
-    const box = getElementBox(preview, id)
-    return { id, part, box }
-  })
+  const sourceParts = topLevelParts(source.svg)
+    .filter((part) => part.getAttribute('display') !== 'none' && part.getAttribute('visibility') !== 'hidden')
+    .map((part, index) => {
+      const id = part.getAttribute('data-k40-id') ?? `part-${index}`
+      part.setAttribute('data-k40-id', id)
+      const box = getElementBox(preview, id)
+      return { id, part, box }
+    })
 
-  const packedParts = sourceParts
-    .filter((item): item is { id: string; part: SVGElement; box: DOMRect } => Boolean(item.box))
-    .map((item) => ({
-      id: item.id,
-      width: item.box.width * sourceInfo.unitX,
-      height: item.box.height * sourceInfo.unitY,
+  const layoutParts = sourceParts.filter(
+    (item): item is LayoutPart => Boolean(item.box),
+  )
+  const clusters = buildLayoutClusters(layoutParts)
+  const packedParts = clusters
+    .map((cluster) => ({
+      id: cluster.id,
+      width: cluster.box.width * sourceInfo.unitX,
+      height: cluster.box.height * sourceInfo.unitY,
     }))
     .sort((a, b) => b.height * b.width - a.height * a.width)
 
@@ -348,8 +541,8 @@ function autoLayoutSvg(text: string, preview: HTMLDivElement | null, gapMm: numb
   }
 
   placements.forEach((placement) => {
-    const sourcePart = sourceParts.find((part) => part.id === placement.id)
-    if (!sourcePart?.box) {
+    const cluster = clusters.find((item) => item.id === placement.id)
+    if (!cluster) {
       return
     }
 
@@ -359,14 +552,16 @@ function autoLayoutSvg(text: string, preview: HTMLDivElement | null, gapMm: numb
     }
 
     const wrapper = output.createElementNS('http://www.w3.org/2000/svg', 'g')
-    const box = sourcePart.box
+    const box = cluster.box
     const translateX = placement.x - box.x * sourceInfo.unitX
     const translateY = placement.sheet * BED_HEIGHT_MM + placement.y - box.y * sourceInfo.unitY
     wrapper.setAttribute(
       'transform',
       `translate(${translateX.toFixed(4)} ${translateY.toFixed(4)}) scale(${sourceInfo.unitX.toFixed(6)} ${sourceInfo.unitY.toFixed(6)})`,
     )
-    wrapper.appendChild(output.importNode(sourcePart.part, true))
+    cluster.parts.forEach((sourcePart) => {
+      wrapper.appendChild(output.importNode(sourcePart.part, true))
+    })
     sheetGroup.appendChild(wrapper)
   })
 
@@ -387,18 +582,71 @@ function downloadSvg(text: string, fileName: string) {
   URL.revokeObjectURL(url)
 }
 
+function LayerTree({
+  nodes,
+  onRename,
+  onToggleVisibility,
+}: {
+  nodes: LayerNode[]
+  onRename: (id: string, name: string) => void
+  onToggleVisibility: (id: string, visible: boolean) => void
+}) {
+  function renderNode(node: LayerNode, depth: number) {
+    return (
+      <li className="layer-item" key={`${node.id}-${node.name}-${node.hidden}`}>
+        <div className="layer-row" style={{ paddingLeft: `${depth * 14}px` }}>
+          <button
+            type="button"
+            className={`icon-button visibility-toggle ${node.hidden ? 'muted' : ''}`}
+            onClick={() => onToggleVisibility(node.id, node.hidden)}
+            aria-label={node.hidden ? `Show ${node.name}` : `Hide ${node.name}`}
+            title={node.hidden ? 'Show layer' : 'Hide layer'}
+          >
+            {node.hidden ? 'Off' : 'On'}
+          </button>
+          <span className="layer-tag">{node.tag}</span>
+          <input
+            className="layer-name"
+            defaultValue={node.name}
+            aria-label={`Layer name for ${node.name}`}
+            onBlur={(event) => onRename(node.id, event.currentTarget.value)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                event.currentTarget.blur()
+              }
+            }}
+          />
+        </div>
+        {node.children.length > 0 ? (
+          <ul className="layer-children">
+            {node.children.map((child) => renderNode(child, depth + 1))}
+          </ul>
+        ) : null}
+      </li>
+    )
+  }
+
+  return <ul className="layer-tree">{nodes.map((node) => renderNode(node, 0))}</ul>
+}
+
 function App() {
-  const [svgText, setSvgText] = useState(() => normaliseSvg(sampleSvg))
+  const [history, setHistory] = useState<HistoryState>(() => ({
+    past: [],
+    present: normaliseSvg(sampleSvg),
+    future: [],
+  }))
   const [fileName, setFileName] = useState('k40-sample.svg')
   const [toolMode, setToolMode] = useState<ToolMode>('measure')
   const [selectedPoints, setSelectedPoints] = useState<Point[]>([])
   const [targetDistance, setTargetDistance] = useState('')
   const [gapMm, setGapMm] = useState(2)
   const [status, setStatus] = useState('Sample loaded')
-  const [sheetCount, setSheetCount] = useState(1)
   const previewRef = useRef<HTMLDivElement>(null)
+  const svgText = history.present
 
   const svgInfo = useMemo(() => getSvgInfo(svgText), [svgText])
+  const sheetCount = useMemo(() => getSheetCount(svgText), [svgText])
+  const layers = useMemo(() => getLayerTree(svgText), [svgText])
   const measuredDistance = selectedPoints.length === 2
     ? distanceInMm(selectedPoints[0], selectedPoints[1], svgInfo)
     : null
@@ -406,6 +654,77 @@ function App() {
     100,
     ((svgInfo.widthMm * svgInfo.heightMm) / (BED_WIDTH_MM * BED_HEIGHT_MM)) * 100,
   )
+
+  function commitSvg(nextText: string, nextStatus: string, reset = false) {
+    setHistory((current) => {
+      if (nextText === current.present) {
+        return current
+      }
+
+      if (reset) {
+        return { past: [], present: nextText, future: [] }
+      }
+
+      return {
+        past: [...current.past.slice(-(MAX_HISTORY - 1)), current.present],
+        present: nextText,
+        future: [],
+      }
+    })
+    setSelectedPoints([])
+    setStatus(nextStatus)
+  }
+
+  function updateSvg(updater: (current: string) => string, nextStatus: string) {
+    setHistory((current) => {
+      const nextText = updater(current.present)
+      if (nextText === current.present) {
+        return current
+      }
+
+      return {
+        past: [...current.past.slice(-(MAX_HISTORY - 1)), current.present],
+        present: nextText,
+        future: [],
+      }
+    })
+    setSelectedPoints([])
+    setStatus(nextStatus)
+  }
+
+  function undo() {
+    setHistory((current) => {
+      const previous = current.past.at(-1)
+      if (!previous) {
+        return current
+      }
+
+      return {
+        past: current.past.slice(0, -1),
+        present: previous,
+        future: [current.present, ...current.future],
+      }
+    })
+    setSelectedPoints([])
+    setStatus('Undo')
+  }
+
+  function redo() {
+    setHistory((current) => {
+      const next = current.future[0]
+      if (!next) {
+        return current
+      }
+
+      return {
+        past: [...current.past, current.present],
+        present: next,
+        future: current.future.slice(1),
+      }
+    })
+    setSelectedPoints([])
+    setStatus('Redo')
+  }
 
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0]
@@ -417,11 +736,8 @@ function App() {
     reader.addEventListener('load', () => {
       try {
         const text = String(reader.result ?? '')
-        setSvgText(normaliseSvg(text))
+        commitSvg(normaliseSvg(text), `${file.name} opened`, true)
         setFileName(file.name)
-        setSelectedPoints([])
-        setSheetCount(1)
-        setStatus(`${file.name} opened`)
       } catch (error) {
         setStatus(error instanceof Error ? error.message : 'Could not open that SVG.')
       }
@@ -449,8 +765,10 @@ function App() {
     }
 
     const color = toolMode === 'cut' ? CUT_RED : ENGRAVE_BLUE
-    setSvgText((current) => updateElementStroke(current, id, color))
-    setStatus(toolMode === 'cut' ? 'Outline marked for vector cut' : 'Outline marked for vector engrave')
+    updateSvg(
+      (current) => updateElementStroke(current, id, color),
+      toolMode === 'cut' ? 'Outline marked for vector cut' : 'Outline marked for vector engrave',
+    )
   }
 
   function applyDistanceScale() {
@@ -461,34 +779,35 @@ function App() {
     }
 
     const scale = nextDistance / measuredDistance
-    setSvgText((current) => normaliseSvg(scaleSvg(current, scale)))
-    setSelectedPoints((current) =>
-      current.map((point) => ({
-        x: point.x * scale,
-        y: point.y * scale,
-      })),
-    )
-    setStatus(`Scaled artwork by ${scale.toFixed(4)}x`)
+    updateSvg((current) => normaliseSvg(scaleSvg(current, scale)), `Scaled artwork by ${scale.toFixed(4)}x`)
   }
 
   function runAutoLayout() {
     try {
       const result = autoLayoutSvg(svgText, previewRef.current, gapMm)
-      setSvgText(normaliseSvg(result.text))
-      setSelectedPoints([])
-      setSheetCount(result.sheetCount)
-      setStatus(`${result.placements.length} elements packed into ${result.sheetCount} sheet${result.sheetCount === 1 ? '' : 's'}`)
+      commitSvg(
+        normaliseSvg(result.text),
+        `${result.placements.length} elements packed into ${result.sheetCount} sheet${result.sheetCount === 1 ? '' : 's'}`,
+      )
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Auto layout failed')
     }
   }
 
   function resetSample() {
-    setSvgText(normaliseSvg(sampleSvg))
+    commitSvg(normaliseSvg(sampleSvg), 'Sample loaded', true)
     setFileName('k40-sample.svg')
-    setSelectedPoints([])
-    setSheetCount(1)
-    setStatus('Sample loaded')
+  }
+
+  function renameLayerItem(id: string, name: string) {
+    updateSvg((current) => renameLayer(current, id, name), 'Layer renamed')
+  }
+
+  function toggleLayerVisibility(id: string, currentlyHidden: boolean) {
+    updateSvg(
+      (current) => setLayerVisibility(current, id, currentlyHidden),
+      currentlyHidden ? 'Layer shown' : 'Layer hidden',
+    )
   }
 
   return (
@@ -499,6 +818,12 @@ function App() {
           <h1>Laser-ready layout for a 300 x 200 mm bed</h1>
         </div>
         <div className="topbar-actions">
+          <button type="button" onClick={undo} disabled={history.past.length === 0}>
+            Undo
+          </button>
+          <button type="button" onClick={redo} disabled={history.future.length === 0}>
+            Redo
+          </button>
           <label className="file-button">
             Open SVG
             <input type="file" accept=".svg,image/svg+xml" onChange={handleFileChange} />
@@ -623,6 +948,15 @@ function App() {
         </section>
 
         <aside className="panel">
+          <div className="panel-section layers-section">
+            <h2>Layers</h2>
+            <LayerTree
+              nodes={layers}
+              onRename={renameLayerItem}
+              onToggleVisibility={toggleLayerVisibility}
+            />
+          </div>
+
           <div className="panel-section">
             <h2>K40 Mapping</h2>
             <div className="legend">
