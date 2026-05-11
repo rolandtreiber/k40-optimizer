@@ -81,8 +81,16 @@ type DragState = {
   startPoint: Point
   currentPoint: Point
   startBox: SelectedBox
+  startCenter: Point
   selectedIds: string[]
+  transformSnapshots: TransformSnapshot[]
   uniform: boolean
+}
+
+type TransformSnapshot = {
+  id: string
+  parentMatrix: DOMMatrix
+  existingMatrix: DOMMatrix
 }
 
 type DragPreview = {
@@ -719,34 +727,60 @@ function getElementTransformMatrix(element: SVGGraphicsElement) {
   return transform ? domMatrixFromSvgMatrix(transform.matrix) : new DOMMatrix()
 }
 
-function buildLocalTransformMap(preview: HTMLDivElement | null, ids: string[], rootDelta: DOMMatrix) {
-  const transforms = new Map<string, string>()
+function getElementParentMatrixInRoot(svg: SVGSVGElement, element: SVGGraphicsElement, existingMatrix: DOMMatrix) {
+  const svgScreenMatrix = svg.getScreenCTM()
+  const elementScreenMatrix = element.getScreenCTM()
+  if (!svgScreenMatrix || !elementScreenMatrix) {
+    return null
+  }
+
+  try {
+    const elementMatrixInRoot = domMatrixFromSvgMatrix(svgScreenMatrix)
+      .inverse()
+      .multiply(domMatrixFromSvgMatrix(elementScreenMatrix))
+
+    return elementMatrixInRoot.multiply(existingMatrix.inverse())
+  } catch {
+    return null
+  }
+}
+
+function getTransformSnapshots(preview: HTMLDivElement | null, ids: string[]) {
+  const snapshots: TransformSnapshot[] = []
   const svg = preview?.querySelector('svg') as SVGSVGElement | null
   if (!svg) {
-    return transforms
+    return snapshots
   }
 
   ids.forEach((id) => {
     const element = svg.querySelector(`[data-k40-id="${CSS.escape(id)}"]`) as SVGGraphicsElement | null
-    const parent = element?.parentElement as SVGGraphicsElement | SVGSVGElement | null
-    if (!element || !parent) {
-      return
-    }
-
-    const parentCtm = parent === svg ? null : parent.getCTM()
-    const parentMatrix = parent === svg
-      ? new DOMMatrix()
-      : parentCtm
-        ? domMatrixFromSvgMatrix(parentCtm)
-        : null
-    if (!parentMatrix) {
+    if (!element) {
       return
     }
 
     const existingMatrix = getElementTransformMatrix(element)
-    const localDelta = parentMatrix.inverse().multiply(rootDelta).multiply(parentMatrix)
-    const nextMatrix = localDelta.multiply(existingMatrix)
-    transforms.set(id, matrixToString(nextMatrix))
+    const parentMatrix = getElementParentMatrixInRoot(svg, element, existingMatrix)
+    if (!parentMatrix) {
+      return
+    }
+
+    snapshots.push({ id, parentMatrix, existingMatrix })
+  })
+
+  return snapshots
+}
+
+function buildLocalTransformMap(snapshots: TransformSnapshot[], rootDelta: DOMMatrix) {
+  const transforms = new Map<string, string>()
+
+  snapshots.forEach(({ id, parentMatrix, existingMatrix }) => {
+    try {
+      const localDelta = parentMatrix.inverse().multiply(rootDelta).multiply(parentMatrix)
+      const nextMatrix = localDelta.multiply(existingMatrix)
+      transforms.set(id, matrixToString(nextMatrix))
+    } catch {
+      // Ignore non-invertible transforms so one unusual element does not break the whole drag.
+    }
   })
 
   return transforms
@@ -1336,6 +1370,11 @@ function App() {
       return
     }
 
+    const transformSnapshots = getTransformSnapshots(previewRef.current, selectedIds)
+    if (transformSnapshots.length === 0) {
+      return
+    }
+
     event.preventDefault()
     event.stopPropagation()
     event.currentTarget.setPointerCapture(event.pointerId)
@@ -1345,7 +1384,12 @@ function App() {
       startPoint,
       currentPoint: startPoint,
       startBox: selectionBox,
+      startCenter: {
+        x: selectionBox.x + selectionBox.width / 2,
+        y: selectionBox.y + selectionBox.height / 2,
+      },
       selectedIds: [...selectedIds],
+      transformSnapshots,
       uniform: event.shiftKey,
     }
     setStatus(action === 'move' ? 'Dragging selection' : 'Editing selection')
@@ -1380,12 +1424,8 @@ function App() {
     }
 
     if (dragState.action === 'rotate') {
-      const center = {
-        x: dragState.startBox.x + dragState.startBox.width / 2,
-        y: dragState.startBox.y + dragState.startBox.height / 2,
-      }
-      const startAngle = pointAngle(center, dragState.startPoint)
-      const currentAngle = pointAngle(center, currentPoint)
+      const startAngle = pointAngle(dragState.startCenter, dragState.startPoint)
+      const currentAngle = pointAngle(dragState.startCenter, currentPoint)
       setDragPreview({
         dx: 0,
         dy: 0,
@@ -1424,8 +1464,7 @@ function App() {
       const dx = endPoint.x - dragState.startPoint.x
       const dy = endPoint.y - dragState.startPoint.y
       const transforms = buildLocalTransformMap(
-        previewRef.current,
-        dragState.selectedIds,
+        dragState.transformSnapshots,
         rootMoveMatrix(dx, dy),
       )
       updateSvg(
@@ -1436,15 +1475,12 @@ function App() {
     }
 
     if (dragState.action === 'rotate') {
-      const center = {
-        x: dragState.startBox.x + dragState.startBox.width / 2,
-        y: dragState.startBox.y + dragState.startBox.height / 2,
-      }
-      const degrees = toDegrees(pointAngle(center, endPoint) - pointAngle(center, dragState.startPoint))
+      const degrees = toDegrees(
+        pointAngle(dragState.startCenter, endPoint) - pointAngle(dragState.startCenter, dragState.startPoint),
+      )
       const transforms = buildLocalTransformMap(
-        previewRef.current,
-        dragState.selectedIds,
-        rootRotateMatrix(degrees, center),
+        dragState.transformSnapshots,
+        rootRotateMatrix(degrees, dragState.startCenter),
       )
       updateSvg(
         (current) => applyElementTransforms(current, transforms),
@@ -1454,8 +1490,7 @@ function App() {
     }
 
     const transforms = buildLocalTransformMap(
-      previewRef.current,
-      dragState.selectedIds,
+      dragState.transformSnapshots,
       rootResizeMatrix(dragState.action, dragState.startBox, endPoint, dragState.uniform),
     )
     updateSvg(
