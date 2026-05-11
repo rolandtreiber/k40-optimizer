@@ -19,6 +19,7 @@ type SvgInfo = {
   unitY: number
   elementCount: number
   rasterCount: number
+  preserveAspectRatio: string
 }
 
 type Point = {
@@ -100,8 +101,11 @@ const CUT_RED = 'rgb(255, 0, 0)'
 const ENGRAVE_BLUE = 'rgb(0, 0, 255)'
 const GRAPHIC_SELECTOR =
   'path,line,polyline,polygon,rect,circle,ellipse,g,image,use,text'
+const HIT_TEST_SELECTOR =
+  'path,line,polyline,polygon,rect,circle,ellipse,image,use,text'
 const NON_PART_SELECTOR = 'defs,style,title,desc,metadata,symbol,clipPath,mask,pattern'
 const MAX_HISTORY = 80
+const HIT_TOLERANCE_PX = 6
 
 const sampleSvg = `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="210mm" height="130mm" viewBox="0 0 210 130">
@@ -186,6 +190,7 @@ function getSvgInfo(text: string): SvgInfo {
     unitY: heightMm / viewBox[3],
     elementCount,
     rasterCount,
+    preserveAspectRatio: svg.getAttribute('preserveAspectRatio') || 'xMidYMid meet',
   }
 }
 
@@ -417,12 +422,101 @@ function getSvgPoint(clientX: number, clientY: number, preview: HTMLDivElement |
   return point.matrixTransform(matrix.inverse())
 }
 
-function getClickableTarget(target: EventTarget | null) {
-  if (!(target instanceof Element)) {
+function pointInExpandedRect(rect: DOMRect, x: number, y: number, tolerance: number) {
+  return (
+    x >= rect.left - tolerance &&
+    x <= rect.right + tolerance &&
+    y >= rect.top - tolerance &&
+    y <= rect.bottom + tolerance
+  )
+}
+
+function hasPaintedFill(element: SVGElement) {
+  const style = window.getComputedStyle(element)
+  return style.fill !== 'none' && style.fillOpacity !== '0' && style.visibility !== 'hidden'
+}
+
+function geometryContainsPointNear(
+  element: SVGGeometryElement,
+  clientX: number,
+  clientY: number,
+  tolerance: number,
+) {
+  const svg = element.ownerSVGElement
+  const matrix = element.getScreenCTM()
+  if (!svg || !matrix) {
+    return false
+  }
+
+  const inverse = matrix.inverse()
+  const samples = [
+    [0, 0],
+    [-tolerance, 0],
+    [tolerance, 0],
+    [0, -tolerance],
+    [0, tolerance],
+    [-tolerance * 0.7, -tolerance * 0.7],
+    [tolerance * 0.7, -tolerance * 0.7],
+    [-tolerance * 0.7, tolerance * 0.7],
+    [tolerance * 0.7, tolerance * 0.7],
+  ]
+  const shouldTestFill = hasPaintedFill(element)
+
+  return samples.some(([dx, dy]) => {
+    const point = svg.createSVGPoint()
+    point.x = clientX + dx
+    point.y = clientY + dy
+    const localPoint = point.matrixTransform(inverse)
+    return element.isPointInStroke(localPoint) || (shouldTestFill && element.isPointInFill(localPoint))
+  })
+}
+
+function findNearestClickableTarget(preview: HTMLDivElement | null, clientX: number, clientY: number) {
+  const svg = preview?.querySelector('svg') as SVGSVGElement | null
+  if (!svg) {
     return null
   }
 
-  return target.closest(GRAPHIC_SELECTOR) as SVGElement | null
+  const candidates = Array.from(svg.querySelectorAll(HIT_TEST_SELECTOR)) as SVGElement[]
+  for (const element of candidates.reverse()) {
+    if (!element.getAttribute('data-k40-id')) {
+      continue
+    }
+
+    const rect = element.getBoundingClientRect()
+    if (rect.width === 0 || rect.height === 0 || !pointInExpandedRect(rect, clientX, clientY, HIT_TOLERANCE_PX)) {
+      continue
+    }
+
+    if (element instanceof SVGGeometryElement) {
+      if (geometryContainsPointNear(element, clientX, clientY, HIT_TOLERANCE_PX)) {
+        return element
+      }
+      continue
+    }
+
+    return element
+  }
+
+  return null
+}
+
+function getClickableTarget(
+  target: EventTarget | null,
+  preview: HTMLDivElement | null,
+  clientX: number,
+  clientY: number,
+) {
+  if (!(target instanceof Element)) {
+    return findNearestClickableTarget(preview, clientX, clientY)
+  }
+
+  const directTarget = target.closest(HIT_TEST_SELECTOR) as SVGElement | null
+  if (directTarget?.getAttribute('data-k40-id')) {
+    return directTarget
+  }
+
+  return findNearestClickableTarget(preview, clientX, clientY)
 }
 
 function topLevelParts(svg: SVGSVGElement) {
@@ -487,10 +581,6 @@ function getSelectionBox(preview: HTMLDivElement | null, ids: string[]) {
     width: box.width,
     height: box.height,
   }
-}
-
-function percentInViewBox(value: number, start: number, size: number) {
-  return `${((value - start) / size) * 100}%`
 }
 
 function getResizeAnchor(action: DragAction, box: SelectedBox): Point {
@@ -603,6 +693,27 @@ function buildLocalTransformMap(preview: HTMLDivElement | null, ids: string[], r
   })
 
   return transforms
+}
+
+function dragPreviewTransform(preview: DragPreview | null, box: SelectedBox) {
+  if (!preview) {
+    return undefined
+  }
+
+  if (preview.dx || preview.dy) {
+    return `translate(${preview.dx} ${preview.dy})`
+  }
+
+  const origin = {
+    x: box.x + (preview.originX / 100) * box.width,
+    y: box.y + (preview.originY / 100) * box.height,
+  }
+
+  if (preview.rotation) {
+    return `rotate(${preview.rotation} ${origin.x} ${origin.y})`
+  }
+
+  return `translate(${origin.x} ${origin.y}) scale(${preview.scaleX} ${preview.scaleY}) translate(${-origin.x} ${-origin.y})`
 }
 
 function containsBox(outer: DOMRect, inner: DOMRect) {
@@ -976,6 +1087,10 @@ function App() {
   const measuredDistance = selectedPoints.length === 2
     ? distanceInMm(selectedPoints[0], selectedPoints[1], svgInfo)
     : null
+  const overlayControlRadius = Math.max(1.4, Math.min(svgInfo.viewBox[2], svgInfo.viewBox[3]) * 0.012)
+  const overlayRotateOffset = selectionBox
+    ? Math.max(overlayControlRadius * 4, Math.min(selectionBox.width, selectionBox.height) * 0.08)
+    : overlayControlRadius * 4
   const bedUsage = Math.min(
     100,
     ((svgInfo.widthMm * svgInfo.heightMm) / (BED_WIDTH_MM * BED_HEIGHT_MM)) * 100,
@@ -1082,7 +1197,7 @@ function App() {
 
   function handlePreviewClick(event: MouseEvent<HTMLDivElement>) {
     if (toolMode === 'select') {
-      const target = getClickableTarget(event.target)
+      const target = getClickableTarget(event.target, previewRef.current, event.clientX, event.clientY)
       const id = target?.getAttribute('data-k40-id')
       if (!id) {
         if (!event.shiftKey && !event.metaKey) {
@@ -1117,7 +1232,7 @@ function App() {
       return
     }
 
-    const target = getClickableTarget(event.target)
+    const target = getClickableTarget(event.target, previewRef.current, event.clientX, event.clientY)
     const id = target?.getAttribute('data-k40-id')
     if (!id) {
       setStatus('Select an SVG outline')
@@ -1136,7 +1251,7 @@ function App() {
       return
     }
 
-    const target = getClickableTarget(event.target)
+    const target = getClickableTarget(event.target, previewRef.current, event.clientX, event.clientY)
     const id = target?.getAttribute('data-k40-id')
     if (id && selectedIds.includes(id)) {
       beginSelectionDrag(event, 'move')
@@ -1154,7 +1269,7 @@ function App() {
     updateSvg((current) => normaliseSvg(scaleSvg(current, scale)), `Scaled artwork by ${scale.toFixed(4)}x`)
   }
 
-  function beginSelectionDrag(event: PointerEvent<HTMLElement>, action: DragAction) {
+  function beginSelectionDrag(event: PointerEvent<Element>, action: DragAction) {
     if (!selectionBox || selectedIds.length === 0 || toolMode !== 'select') {
       return
     }
@@ -1179,7 +1294,7 @@ function App() {
     setStatus(action === 'move' ? 'Dragging selection' : 'Editing selection')
   }
 
-  function updateSelectionDrag(event: PointerEvent<HTMLElement>) {
+  function updateSelectionDrag(event: PointerEvent<Element>) {
     const dragState = dragStateRef.current
     if (!dragState || dragState.pointerId !== event.pointerId) {
       return
@@ -1229,7 +1344,7 @@ function App() {
     setDragPreview(resizePreview(dragState.action, dragState.startBox, currentPoint, dragState.uniform))
   }
 
-  function endSelectionDrag(event: PointerEvent<HTMLElement>) {
+  function endSelectionDrag(event: PointerEvent<Element>) {
     const dragState = dragStateRef.current
     if (!dragState || dragState.pointerId !== event.pointerId) {
       return
@@ -1483,92 +1598,114 @@ function App() {
               onPointerCancel={endSelectionDrag}
               dangerouslySetInnerHTML={{ __html: svgText }}
             />
-            <div className="preview-overlay">
+            <svg
+              className="preview-overlay"
+              viewBox={svgInfo.viewBox.join(' ')}
+              preserveAspectRatio={svgInfo.preserveAspectRatio}
+            >
               {toolMode === 'select' && selectionBox ? (
-                <span
+                <g
                   className="selection-box"
+                  transform={dragPreviewTransform(dragPreview, selectionBox)}
                   onPointerDown={(event) => beginSelectionDrag(event, 'move')}
                   onPointerMove={updateSelectionDrag}
                   onPointerUp={endSelectionDrag}
                   onPointerCancel={endSelectionDrag}
-                  style={{
-                    left: percentInViewBox(selectionBox.x + (dragPreview?.dx ?? 0), svgInfo.viewBox[0], svgInfo.viewBox[2]),
-                    top: percentInViewBox(selectionBox.y + (dragPreview?.dy ?? 0), svgInfo.viewBox[1], svgInfo.viewBox[3]),
-                    width: `${(selectionBox.width / svgInfo.viewBox[2]) * 100}%`,
-                    height: `${(selectionBox.height / svgInfo.viewBox[3]) * 100}%`,
-                    transform: dragPreview
-                      ? `scale(${dragPreview.scaleX}, ${dragPreview.scaleY}) rotate(${dragPreview.rotation}deg)`
-                      : undefined,
-                    transformOrigin: dragPreview
-                      ? `${dragPreview.originX}% ${dragPreview.originY}%`
-                      : undefined,
-                  }}
                 >
-                  <span
+                  <rect
+                    className="selection-rect"
+                    x={selectionBox.x}
+                    y={selectionBox.y}
+                    width={selectionBox.width}
+                    height={selectionBox.height}
+                  />
+                  <circle
                     className="resize-handle nw"
-                    role="button"
-                    tabIndex={0}
-                    title="Resize"
+                    cx={selectionBox.x}
+                    cy={selectionBox.y}
+                    r={overlayControlRadius}
                     onPointerDown={(event) => beginSelectionDrag(event, 'resize-nw')}
                     onPointerMove={updateSelectionDrag}
                     onPointerUp={endSelectionDrag}
                     onPointerCancel={endSelectionDrag}
                   />
-                  <span
+                  <circle
                     className="resize-handle ne"
-                    role="button"
-                    tabIndex={0}
-                    title="Resize"
+                    cx={selectionBox.x + selectionBox.width}
+                    cy={selectionBox.y}
+                    r={overlayControlRadius}
                     onPointerDown={(event) => beginSelectionDrag(event, 'resize-ne')}
                     onPointerMove={updateSelectionDrag}
                     onPointerUp={endSelectionDrag}
                     onPointerCancel={endSelectionDrag}
                   />
-                  <span
+                  <circle
                     className="resize-handle sw"
-                    role="button"
-                    tabIndex={0}
-                    title="Resize"
+                    cx={selectionBox.x}
+                    cy={selectionBox.y + selectionBox.height}
+                    r={overlayControlRadius}
                     onPointerDown={(event) => beginSelectionDrag(event, 'resize-sw')}
                     onPointerMove={updateSelectionDrag}
                     onPointerUp={endSelectionDrag}
                     onPointerCancel={endSelectionDrag}
                   />
-                  <span
+                  <circle
                     className="resize-handle se"
-                    role="button"
-                    tabIndex={0}
-                    title="Resize"
+                    cx={selectionBox.x + selectionBox.width}
+                    cy={selectionBox.y + selectionBox.height}
+                    r={overlayControlRadius}
                     onPointerDown={(event) => beginSelectionDrag(event, 'resize-se')}
                     onPointerMove={updateSelectionDrag}
                     onPointerUp={endSelectionDrag}
                     onPointerCancel={endSelectionDrag}
                   />
-                  <span
+                  <line
+                    className="rotate-stem"
+                    x1={selectionBox.x + selectionBox.width}
+                    y1={selectionBox.y + selectionBox.height}
+                    x2={selectionBox.x + selectionBox.width + overlayRotateOffset}
+                    y2={selectionBox.y + selectionBox.height + overlayRotateOffset}
+                  />
+                  <circle
                     className="rotate-handle"
-                    role="button"
-                    tabIndex={0}
-                    title="Rotate"
+                    cx={selectionBox.x + selectionBox.width + overlayRotateOffset}
+                    cy={selectionBox.y + selectionBox.height + overlayRotateOffset}
+                    r={overlayControlRadius * 1.15}
                     onPointerDown={(event) => beginSelectionDrag(event, 'rotate')}
                     onPointerMove={updateSelectionDrag}
                     onPointerUp={endSelectionDrag}
                     onPointerCancel={endSelectionDrag}
                   />
-                </span>
+                </g>
               ) : null}
               {selectedPoints.map((point, index) => (
-                <span
+                <g
                   className="measurement-target"
                   key={`${point.x}-${point.y}-${index}`}
-                  style={{
-                    left: percentInViewBox(point.x, svgInfo.viewBox[0], svgInfo.viewBox[2]),
-                    top: percentInViewBox(point.y, svgInfo.viewBox[1], svgInfo.viewBox[3]),
-                  }}
                 >
-                  <b>{index + 1}</b>
-                </span>
+                  <line
+                    x1={point.x - overlayControlRadius * 1.5}
+                    y1={point.y}
+                    x2={point.x + overlayControlRadius * 1.5}
+                    y2={point.y}
+                  />
+                  <line
+                    x1={point.x}
+                    y1={point.y - overlayControlRadius * 1.5}
+                    x2={point.x}
+                    y2={point.y + overlayControlRadius * 1.5}
+                  />
+                  <circle cx={point.x} cy={point.y} r={overlayControlRadius} />
+                  <text
+                    x={point.x}
+                    y={point.y + overlayControlRadius * 0.28}
+                    fontSize={overlayControlRadius * 1.05}
+                  >
+                    {index + 1}
+                  </text>
+                </g>
               ))}
-            </div>
+            </svg>
           </div>
         </section>
 

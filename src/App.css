@@ -487,128 +487,108 @@ input {
   cursor: copy;
 }
 
-.svg-preview.mode-select :is(path,line,polyline,polygon,rect,circle,ellipse,g,text,image,use),
-.svg-preview.mode-cut :is(path,line,polyline,polygon,rect,circle,ellipse,g,text),
-.svg-preview.mode-engrave :is(path,line,polyline,polygon,rect,circle,ellipse,g,text) {
-  pointer-events: all;
+.svg-preview.mode-select :is(path,line,polyline,polygon,rect,circle,ellipse),
+.svg-preview.mode-cut :is(path,line,polyline,polygon,rect,circle,ellipse),
+.svg-preview.mode-engrave :is(path,line,polyline,polygon,rect,circle,ellipse) {
+  pointer-events: visiblePainted;
+}
+
+.svg-preview.mode-select :is(text,image,use),
+.svg-preview.mode-cut :is(text,image,use),
+.svg-preview.mode-engrave :is(text,image,use) {
+  pointer-events: visiblePainted;
+}
+
+.svg-preview.mode-select g,
+.svg-preview.mode-cut g,
+.svg-preview.mode-engrave g {
+  pointer-events: none;
 }
 
 .preview-overlay {
   position: absolute;
   inset: 12px;
+  width: calc(100% - 24px);
+  height: calc(100% - 24px);
+  overflow: visible;
   pointer-events: none;
 }
 
 .selection-box {
-  position: absolute;
-  display: block;
-  border: 1.5px dashed #006bb3;
-  background: rgba(0, 107, 179, 0.08);
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7);
   cursor: move;
   pointer-events: auto;
   touch-action: none;
-  transform-box: border-box;
+}
+
+.selection-rect {
+  fill: rgba(0, 107, 179, 0.08);
+  stroke: #006bb3;
+  stroke-width: 1.5;
+  stroke-dasharray: 4 3;
+  vector-effect: non-scaling-stroke;
 }
 
 .resize-handle,
 .rotate-handle {
-  position: absolute;
-  z-index: 4;
-  width: 14px;
-  height: 14px;
-  border: 2px solid #ffffff;
-  border-radius: 50%;
-  background: #006bb3;
-  box-shadow: 0 4px 12px rgba(22, 31, 46, 0.22);
+  fill: #006bb3;
+  stroke: #ffffff;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
   pointer-events: auto;
   touch-action: none;
 }
 
 .resize-handle.nw {
-  left: -8px;
-  top: -8px;
   cursor: nwse-resize;
 }
 
 .resize-handle.ne {
-  right: -8px;
-  top: -8px;
   cursor: nesw-resize;
 }
 
 .resize-handle.sw {
-  left: -8px;
-  bottom: -8px;
   cursor: nesw-resize;
 }
 
 .resize-handle.se {
-  right: -8px;
-  bottom: -8px;
   cursor: nwse-resize;
 }
 
 .rotate-handle {
-  right: -24px;
-  bottom: -24px;
-  background: #12314b;
+  fill: #12314b;
   cursor: grab;
 }
 
-.rotate-handle::before {
-  content: '';
-  position: absolute;
-  right: 12px;
-  bottom: 12px;
-  width: 18px;
-  height: 1.5px;
-  background: #12314b;
-  transform: rotate(45deg);
-  transform-origin: right center;
+.rotate-stem {
+  stroke: #12314b;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
 }
 
 .measurement-target {
-  position: absolute;
-  z-index: 3;
-  width: 30px;
-  height: 30px;
-  display: grid;
-  place-items: center;
-  transform: translate(-50%, -50%);
+  pointer-events: none;
 }
 
-.measurement-target::before,
-.measurement-target::after {
-  content: '';
-  position: absolute;
-  background: #12314b;
+.measurement-target line {
+  stroke: #12314b;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
 }
 
-.measurement-target::before {
-  width: 30px;
-  height: 2px;
+.measurement-target circle {
+  fill: #12314b;
+  stroke: #ffffff;
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
 }
 
-.measurement-target::after {
-  width: 2px;
-  height: 30px;
-}
-
-.measurement-target b {
-  position: relative;
-  z-index: 1;
-  width: 18px;
-  height: 18px;
-  display: grid;
-  place-items: center;
-  border: 2px solid #ffffff;
-  border-radius: 50%;
-  background: #12314b;
-  color: #ffffff;
-  font-size: 10px;
+.measurement-target text {
+  fill: #ffffff;
   font-weight: 780;
-  box-shadow: 0 6px 18px rgba(22, 31, 46, 0.22);
+  text-anchor: middle;
+  dominant-baseline: middle;
+  pointer-events: none;
 }
 
 .legend {
