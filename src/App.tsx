@@ -259,6 +259,58 @@ function cleanSvgDocument(doc: Document) {
   })
 }
 
+function styleEntries(style: string) {
+  return style
+    .split(';')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      const separatorIndex = entry.indexOf(':')
+      if (separatorIndex === -1) {
+        return { property: entry.toLowerCase(), value: '', raw: entry }
+      }
+
+      return {
+        property: entry.slice(0, separatorIndex).trim().toLowerCase(),
+        value: entry.slice(separatorIndex + 1).trim(),
+        raw: entry,
+      }
+    })
+}
+
+function inlineStyleHasValue(element: Element, property: string, value: string) {
+  const targetProperty = property.toLowerCase()
+  const targetValue = value.toLowerCase()
+  return styleEntries(element.getAttribute('style') ?? '').some((entry) => {
+    const entryValue = entry.value.replace(/\s*!important\s*$/i, '').trim().toLowerCase()
+    return entry.property === targetProperty && entryValue === targetValue
+  })
+}
+
+function removeInlineStyleProperties(element: Element, properties: string[]) {
+  const propertySet = new Set(properties.map((property) => property.toLowerCase()))
+  const nextStyle = styleEntries(element.getAttribute('style') ?? '')
+    .filter((entry) => !propertySet.has(entry.property))
+    .map((entry) => entry.raw)
+    .join(';')
+
+  if (nextStyle) {
+    element.setAttribute('style', nextStyle)
+  } else {
+    element.removeAttribute('style')
+  }
+}
+
+function setInlineStyleProperty(element: Element, property: string, value: string) {
+  const targetProperty = property.toLowerCase()
+  const entries = styleEntries(element.getAttribute('style') ?? '')
+    .filter((entry) => entry.property !== targetProperty)
+    .map((entry) => entry.raw)
+
+  entries.push(`${property}:${value}`)
+  element.setAttribute('style', entries.join(';'))
+}
+
 function hasSheetGroups(svg: SVGSVGElement) {
   return svg.querySelector(':scope > g[data-k40-sheet]') !== null
 }
@@ -364,12 +416,11 @@ function getLayerTree(text: string): LayerNode[] {
       .map(toNode)
       .filter((node): node is LayerNode => Boolean(node))
     const name = element.getAttribute('data-k40-name') || element.getAttribute('id') || tag
-    const style = element.getAttribute('style') ?? ''
     const hidden =
       element.getAttribute('display') === 'none' ||
       element.getAttribute('visibility') === 'hidden' ||
-      /(?:^|;)\s*display\s*:\s*none\s*(?:;|$)/i.test(style) ||
-      /(?:^|;)\s*visibility\s*:\s*hidden\s*(?:;|$)/i.test(style)
+      inlineStyleHasValue(element, 'display', 'none') ||
+      inlineStyleHasValue(element, 'visibility', 'hidden')
 
     return {
       id,
@@ -433,10 +484,13 @@ function setLayerVisibility(text: string, k40Id: string, visible: boolean) {
 
   if (visible) {
     element.removeAttribute('display')
+    element.removeAttribute('visibility')
     element.removeAttribute('data-k40-hidden')
+    removeInlineStyleProperties(element, ['display', 'visibility'])
   } else {
     element.setAttribute('display', 'none')
     element.setAttribute('data-k40-hidden', 'true')
+    setInlineStyleProperty(element, 'display', 'none')
   }
 
   return serializeSvg(doc)
