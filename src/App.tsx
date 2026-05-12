@@ -150,6 +150,22 @@ type NestCandidate = {
   sheets: number
 }
 
+type SvgNestInput = {
+  text: string
+  width: number
+  height: number
+}
+
+type NestPart = {
+  element: Element
+  box: DOMRect
+}
+
+type SheetCluster = {
+  parts: NestPart[]
+  box: DOMRect
+}
+
 const BED_WIDTH_MM = 300
 const BED_HEIGHT_MM = 200
 const CUT_RED = 'rgb(255, 0, 0)'
@@ -398,10 +414,27 @@ function normaliseSvg(text: string) {
   }
 
   let nextId = 1
-  svg.querySelectorAll(GRAPHIC_SELECTOR).forEach((element) => {
-    if (!element.getAttribute('data-k40-id')) {
-      element.setAttribute('data-k40-id', `k40-${nextId}`)
+  const usedK40Ids = new Set<string>()
+
+  function nextK40Id() {
+    let candidate = `k40-${nextId}`
+    nextId += 1
+
+    while (usedK40Ids.has(candidate)) {
+      candidate = `k40-${nextId}`
       nextId += 1
+    }
+
+    usedK40Ids.add(candidate)
+    return candidate
+  }
+
+  svg.querySelectorAll(GRAPHIC_SELECTOR).forEach((element) => {
+    const currentK40Id = element.getAttribute('data-k40-id')
+    if (currentK40Id && !usedK40Ids.has(currentK40Id)) {
+      usedK40Ids.add(currentK40Id)
+    } else {
+      element.setAttribute('data-k40-id', nextK40Id())
     }
 
     if (!element.getAttribute('data-k40-name')) {
@@ -509,6 +542,20 @@ function setLayerVisibility(text: string, k40Id: string, visible: boolean) {
     element.setAttribute('data-k40-hidden', 'true')
     setInlineStyleProperty(element, 'display', 'none')
   }
+
+  return serializeSvg(doc)
+}
+
+function makeAllElementsVisible(text: string) {
+  const { doc, svg } = parseSvg(text)
+  svg.querySelectorAll(GRAPHIC_SELECTOR).forEach((element) => {
+    element.removeAttribute('display')
+    element.removeAttribute('visibility')
+    element.removeAttribute('data-k40-hidden')
+    removeInlineStyleProperties(element, ['display', 'visibility'])
+    setInlineStyleProperty(element, 'display', 'inline')
+    setInlineStyleProperty(element, 'visibility', 'visible')
+  })
 
   return serializeSvg(doc)
 }
@@ -716,17 +763,19 @@ function getElementBox(preview: HTMLDivElement, id: string) {
   }
 
   try {
-    const rect = element.getBoundingClientRect()
-    const matrix = svg.getScreenCTM()?.inverse()
-    if (!matrix || rect.width === 0 || rect.height === 0) {
+    const box = element.getBBox()
+    const svgMatrix = svg.getScreenCTM()
+    const elementMatrix = element.getScreenCTM()
+    if (!svgMatrix || !elementMatrix || box.width === 0 || box.height === 0) {
       return null
     }
 
+    const matrix = svgMatrix.inverse().multiply(elementMatrix)
     const corners = [
-      { x: rect.left, y: rect.top },
-      { x: rect.right, y: rect.top },
-      { x: rect.right, y: rect.bottom },
-      { x: rect.left, y: rect.bottom },
+      { x: box.x, y: box.y },
+      { x: box.x + box.width, y: box.y },
+      { x: box.x + box.width, y: box.y + box.height },
+      { x: box.x, y: box.y + box.height },
     ].map((corner) => {
       const point = svg.createSVGPoint()
       point.x = corner.x
@@ -1043,14 +1092,32 @@ function cloneVisibleSvgElement(element: SVGElement) {
   return clone
 }
 
-function createSvgNestInput(text: string) {
+function estimateNestCanvas(sourceSvg: SVGSVGElement, partCount: number) {
+  const viewBox = readViewBox(sourceSvg)
+  const sourceWidth = parseLengthToMm(sourceSvg.getAttribute('width'), viewBox[2])
+  const sourceHeight = parseLengthToMm(sourceSvg.getAttribute('height'), viewBox[3])
+  const columns = Math.max(1, Math.ceil(Math.sqrt(partCount)))
+  const rows = Math.max(1, Math.ceil(partCount / columns))
+
+  return {
+    width: Math.max(BED_WIDTH_MM, sourceWidth, BED_WIDTH_MM * columns),
+    height: Math.max(BED_HEIGHT_MM, sourceHeight, BED_HEIGHT_MM * rows),
+  }
+}
+
+function createSvgNestInput(text: string): SvgNestInput {
   const source = parseSvg(text)
   const output = document.implementation.createDocument('http://www.w3.org/2000/svg', 'svg')
   const svg = output.documentElement as unknown as SVGSVGElement
+  const parts = topLevelParts(source.svg)
+    .map((part) => cloneVisibleSvgElement(part))
+    .filter((part): part is SVGElement => Boolean(part))
+  const canvas = estimateNestCanvas(source.svg, parts.length)
+
   svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
-  svg.setAttribute('width', `${BED_WIDTH_MM}mm`)
-  svg.setAttribute('height', `${BED_HEIGHT_MM}mm`)
-  svg.setAttribute('viewBox', `0 0 ${BED_WIDTH_MM} ${BED_HEIGHT_MM}`)
+  svg.setAttribute('width', `${canvas.width}mm`)
+  svg.setAttribute('height', `${canvas.height}mm`)
+  svg.setAttribute('viewBox', `0 0 ${canvas.width} ${canvas.height}`)
 
   source.svg.querySelectorAll('defs,style').forEach((node) => {
     svg.appendChild(output.importNode(node, true))
@@ -1060,28 +1127,25 @@ function createSvgNestInput(text: string) {
   bin.setAttribute('id', SVGNEST_BIN_ID)
   bin.setAttribute('x', '0')
   bin.setAttribute('y', '0')
-  bin.setAttribute('width', String(BED_WIDTH_MM))
-  bin.setAttribute('height', String(BED_HEIGHT_MM))
+  bin.setAttribute('width', String(canvas.width))
+  bin.setAttribute('height', String(canvas.height))
   bin.setAttribute('fill', 'none')
   bin.setAttribute('stroke', 'none')
   svg.appendChild(bin)
 
-  let partCount = 0
-  topLevelParts(source.svg).forEach((part) => {
-    const clone = cloneVisibleSvgElement(part)
-    if (!clone) {
-      return
-    }
-
+  parts.forEach((clone) => {
     svg.appendChild(output.importNode(clone, true))
-    partCount += 1
   })
 
-  if (partCount === 0) {
+  if (parts.length === 0) {
     throw new Error('No visible vector parts were found.')
   }
 
-  return serializeSvg(output)
+  return {
+    text: serializeSvg(output),
+    width: canvas.width,
+    height: canvas.height,
+  }
 }
 
 function isSvgNestBinElement(element: Element) {
@@ -1089,39 +1153,183 @@ function isSvgNestBinElement(element: Element) {
   return element.getAttribute('id') === SVGNEST_BIN_ID || classes.includes('bin')
 }
 
-function combineSvgNestSheets(svgList: SVGSVGElement[], sourceText: string) {
+function boxFromSvgElement(svg: SVGSVGElement, element: SVGGraphicsElement) {
+  const box = element.getBBox()
+  const svgMatrix = svg.getScreenCTM()
+  const elementMatrix = element.getScreenCTM()
+  if (!svgMatrix || !elementMatrix || box.width === 0 || box.height === 0) {
+    return null
+  }
+
+  const matrix = svgMatrix.inverse().multiply(elementMatrix)
+  const corners = [
+    { x: box.x, y: box.y },
+    { x: box.x + box.width, y: box.y },
+    { x: box.x + box.width, y: box.y + box.height },
+    { x: box.x, y: box.y + box.height },
+  ].map((corner) => {
+    const point = svg.createSVGPoint()
+    point.x = corner.x
+    point.y = corner.y
+    return point.matrixTransform(matrix)
+  })
+
+  const minX = Math.min(...corners.map((corner) => corner.x))
+  const minY = Math.min(...corners.map((corner) => corner.y))
+  const maxX = Math.max(...corners.map((corner) => corner.x))
+  const maxY = Math.max(...corners.map((corner) => corner.y))
+  return new DOMRect(minX, minY, maxX - minX, maxY - minY)
+}
+
+function measureNestParts(sheetSvg: SVGSVGElement, canvas: { width: number; height: number }) {
+  const svg = sheetSvg.cloneNode(false) as SVGSVGElement
+  const sourceParts: Element[] = []
+  svg.setAttribute('width', `${canvas.width}px`)
+  svg.setAttribute('height', `${canvas.height}px`)
+  svg.setAttribute('viewBox', `0 0 ${canvas.width} ${canvas.height}`)
+
+  Array.from(sheetSvg.children).forEach((child) => {
+    if (child.matches(NON_PART_SELECTOR) || isSvgNestBinElement(child)) {
+      return
+    }
+
+    const measured = child.cloneNode(true) as Element
+    measured.setAttribute('data-k40-measure-index', String(sourceParts.length))
+    svg.appendChild(measured)
+    sourceParts.push(child.cloneNode(true) as Element)
+  })
+
+  const container = document.createElement('div')
+  container.style.position = 'fixed'
+  container.style.left = '-100000px'
+  container.style.top = '0'
+  container.style.width = `${canvas.width}px`
+  container.style.height = `${canvas.height}px`
+  container.style.overflow = 'hidden'
+  container.style.visibility = 'hidden'
+  container.appendChild(svg)
+  document.body.appendChild(container)
+
+  try {
+    return Array.from(svg.children)
+      .map((element) => {
+        const index = Number(element.getAttribute('data-k40-measure-index'))
+        const source = sourceParts[index]
+        const box = boxFromSvgElement(svg, element as unknown as SVGGraphicsElement)
+        if (!source || !box) {
+          return null
+        }
+
+        return {
+          element: source,
+          box,
+        }
+      })
+      .filter((part): part is NestPart => Boolean(part))
+  } finally {
+    container.remove()
+  }
+}
+
+function boxDistance(a: DOMRect, b: DOMRect) {
+  const dx = Math.max(a.x - (b.x + b.width), b.x - (a.x + a.width), 0)
+  const dy = Math.max(a.y - (b.y + b.height), b.y - (a.y + a.height), 0)
+  return Math.hypot(dx, dy)
+}
+
+function canFitOnSheet(box: DOMRect) {
+  return box.width <= BED_WIDTH_MM && box.height <= BED_HEIGHT_MM
+}
+
+function clusterNestParts(parts: NestPart[]) {
+  const remaining = [...parts].sort((a, b) => a.box.y - b.box.y || a.box.x - b.box.x)
+  const clusters: SheetCluster[] = []
+
+  while (remaining.length > 0) {
+    const seed = remaining.shift()!
+    let clusterParts = [seed]
+    let clusterBox = seed.box
+
+    if (canFitOnSheet(clusterBox)) {
+      let added = true
+      while (added) {
+        added = false
+        const candidates = remaining
+          .map((part, index) => ({
+            part,
+            index,
+            box: unionBoxes([...clusterParts.map((item) => item.box), part.box]),
+          }))
+          .filter((candidate) => canFitOnSheet(candidate.box))
+          .sort((a, b) => boxDistance(clusterBox, a.part.box) - boxDistance(clusterBox, b.part.box))
+
+        const best = candidates[0]
+        if (best) {
+          clusterParts = [...clusterParts, best.part]
+          clusterBox = best.box
+          remaining.splice(best.index, 1)
+          added = true
+        }
+      }
+    }
+
+    clusters.push({
+      parts: clusterParts,
+      box: clusterBox,
+    })
+  }
+
+  return clusters
+}
+
+function combineSvgNestSheets(
+  svgList: SVGSVGElement[],
+  sourceText: string,
+  canvas: SvgNestInput,
+) {
   const source = parseSvg(sourceText)
+  const clusters = svgList.flatMap((sheetSvg) => clusterNestParts(measureNestParts(sheetSvg, canvas)))
   const output = document.implementation.createDocument('http://www.w3.org/2000/svg', 'svg')
   const svg = output.documentElement as unknown as SVGSVGElement
-  const sheetCount = Math.max(1, svgList.length)
+  const sheetCount = Math.max(1, clusters.length)
 
   svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
   svg.setAttribute('width', `${BED_WIDTH_MM}mm`)
-  svg.setAttribute('height', `${BED_HEIGHT_MM * sheetCount}mm`)
-  svg.setAttribute('viewBox', `0 0 ${BED_WIDTH_MM} ${BED_HEIGHT_MM * sheetCount}`)
+  svg.setAttribute('height', `${BED_HEIGHT_MM}mm`)
+  svg.setAttribute('viewBox', `0 0 ${BED_WIDTH_MM} ${BED_HEIGHT_MM}`)
 
   source.svg.querySelectorAll('defs,style').forEach((node) => {
     svg.appendChild(output.importNode(node, true))
   })
 
-  svgList.forEach((sheetSvg, sheetIndex) => {
+  clusters.forEach((cluster, sheetIndex) => {
     const group = output.createElementNS('http://www.w3.org/2000/svg', 'g')
     group.setAttribute('id', `sheet-${sheetIndex + 1}`)
+    group.setAttribute('data-k40-id', `sheet-${sheetIndex + 1}`)
+    group.setAttribute('data-k40-name', `sheet-${sheetIndex + 1}`)
     group.setAttribute('data-k40-sheet', String(sheetIndex + 1))
-    group.setAttribute('transform', `translate(0 ${sheetIndex * BED_HEIGHT_MM})`)
+    if (sheetIndex > 0) {
+      group.setAttribute('display', 'none')
+      group.setAttribute('data-k40-hidden', 'true')
+      setInlineStyleProperty(group, 'display', 'none')
+    }
+    group.setAttribute(
+      'transform',
+      `translate(${(-cluster.box.x).toFixed(4)} ${(-cluster.box.y).toFixed(4)})`,
+    )
 
-    Array.from(sheetSvg.children).forEach((child) => {
-      if (child.matches(NON_PART_SELECTOR) || isSvgNestBinElement(child)) {
-        return
-      }
-
-      group.appendChild(output.importNode(child, true))
+    cluster.parts.forEach((part) => {
+      const imported = output.importNode(part.element, true) as Element
+      group.appendChild(imported)
     })
 
     svg.appendChild(group)
   })
 
-  return serializeSvg(output)
+  return {
+    text: serializeSvg(output),
+    sheets: sheetCount,
+  }
 }
 
 function LayerTree({
@@ -1263,6 +1471,7 @@ function App() {
   const [nestStatus, setNestStatus] = useState('')
   const [nestProgress, setNestProgress] = useState(0)
   const [nestCandidate, setNestCandidate] = useState<NestCandidate | null>(null)
+  const [nestMakeAllVisible, setNestMakeAllVisible] = useState(false)
   const previewRef = useRef<HTMLDivElement>(null)
   const dragStateRef = useRef<DragState | null>(null)
   const svgNestRef = useRef<SvgNestApi | null>(null)
@@ -1284,6 +1493,7 @@ function App() {
     100,
     ((svgInfo.widthMm * svgInfo.heightMm) / (BED_WIDTH_MM * BED_HEIGHT_MM)) * 100,
   )
+  const previewAspect = svgInfo.viewBox[2] / svgInfo.viewBox[3]
 
   useEffect(() => {
     const frame = requestAnimationFrame(() => {
@@ -1775,9 +1985,9 @@ function App() {
         curveTolerance: 0.3,
       })
 
-      const sourceText = svgText
+      const sourceText = nestMakeAllVisible ? makeAllElementsVisible(svgText) : svgText
       const nestInput = createSvgNestInput(sourceText)
-      const parsedSvg = api.parsesvg(nestInput)
+      const parsedSvg = api.parsesvg(nestInput.text)
       const bin = parsedSvg.querySelector(`#${SVGNEST_BIN_ID}`)
       if (!bin) {
         throw new Error('Could not prepare the K40 bed for SVGnest.')
@@ -1799,16 +2009,16 @@ function App() {
             return
           }
 
-          const text = combineSvgNestSheets(svgList, sourceText)
+          const result = combineSvgNestSheets(svgList, sourceText, nestInput)
           setNestCandidate({
-            text,
+            text: result.text,
             efficiency,
             placed,
             total,
-            sheets: svgList.length,
+            sheets: result.sheets,
           })
           setNestStatus(
-            `Best so far: ${placed}/${total} parts on ${svgList.length} sheet${svgList.length === 1 ? '' : 's'} (${Math.round(efficiency * 100)}% bed use)`,
+            `Best so far: ${placed}/${total} parts on ${result.sheets} sheet${result.sheets === 1 ? '' : 's'} (${Math.round(efficiency * 100)}% bed use)`,
           )
         },
       )
@@ -2048,7 +2258,13 @@ function App() {
               Load sample
             </button>
           </div>
-          <div className="bed-frame">
+          <div
+            className="bed-frame"
+            style={{
+              aspectRatio: `${svgInfo.viewBox[2]} / ${svgInfo.viewBox[3]}`,
+              width: `min(calc(100% - 64px), 900px, calc((100vh - 148px) * ${previewAspect}))`,
+            }}
+          >
             <div className="bed-ruler x">300 mm</div>
             <div className="bed-ruler y">200 mm</div>
             <div
@@ -2214,6 +2430,14 @@ function App() {
                 />
                 <span className="unit">mm</span>
               </div>
+            </label>
+            <label className="check-field">
+              <input
+                type="checkbox"
+                checked={nestMakeAllVisible}
+                onChange={(event) => setNestMakeAllVisible(event.target.checked)}
+              />
+              <span>Make all elements visible</span>
             </label>
             <button type="button" className="primary-action" onClick={() => void openNestWorkflow()}>
               Auto-position elements

@@ -279,6 +279,23 @@ input {
   font-weight: 650;
 }
 
+.check-field {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 12px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.check-field input {
+  width: 18px;
+  min-height: 18px;
+  flex: 0 0 auto;
+  padding: 0;
+}
+
 .unit {
   color: var(--muted);
   font-size: 13px;
@@ -597,8 +614,7 @@ input {
 .svg-preview {
   position: absolute;
   inset: 12px;
-  display: grid;
-  place-items: center;
+  display: block;
   overflow: hidden;
   cursor: crosshair;
 }
@@ -606,6 +622,7 @@ input {
 .svg-preview svg {
   width: 100%;
   height: 100%;
+  display: block;
   overflow: visible;
 }
 
