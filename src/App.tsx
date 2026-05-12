@@ -370,7 +370,17 @@ function isK40VectorStroke(value: string | null) {
 function setVectorStrokeStyle(element: Element) {
   element.setAttribute('stroke-width', VECTOR_STROKE_WIDTH)
   element.setAttribute('vector-effect', 'non-scaling-stroke')
-  setInlineStyleProperty(element, 'stroke-width', VECTOR_STROKE_WIDTH)
+  setInlineStyleProperty(element, 'stroke-width', `${VECTOR_STROKE_WIDTH} !important`)
+  setInlineStyleProperty(element, 'vector-effect', 'non-scaling-stroke')
+}
+
+function setVectorStrokeColor(element: Element, color: string) {
+  element.setAttribute('stroke', color)
+  element.setAttribute('stroke-opacity', '1')
+  removeInlineStyleProperties(element, ['stroke', 'stroke-opacity'])
+  setInlineStyleProperty(element, 'stroke', `${color} !important`)
+  setInlineStyleProperty(element, 'stroke-opacity', '1')
+  setVectorStrokeStyle(element)
 }
 
 function keepVectorStrokeWidth(element: Element) {
@@ -614,14 +624,12 @@ function updateElementStroke(text: string, id: string, color: string) {
   if (element.nodeName.toLowerCase() === 'g') {
     element.querySelectorAll(GRAPHIC_SELECTOR).forEach((child) => {
       if (child.nodeName.toLowerCase() !== 'image') {
-        child.setAttribute('stroke', color)
-        setVectorStrokeStyle(child)
+        setVectorStrokeColor(child, color)
         child.setAttribute('fill', child.getAttribute('fill') === 'none' ? 'none' : child.getAttribute('fill') ?? 'none')
       }
     })
   } else if (element.nodeName.toLowerCase() !== 'image') {
-    element.setAttribute('stroke', color)
-    setVectorStrokeStyle(element)
+    setVectorStrokeColor(element, color)
     if (!element.getAttribute('fill')) {
       element.setAttribute('fill', 'none')
     }
