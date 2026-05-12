@@ -28,18 +28,6 @@ type Point = {
   y: number
 }
 
-type Placement = {
-  id: string
-  sheet: number
-  x: number
-  y: number
-  width: number
-  height: number
-  placedWidth: number
-  placedHeight: number
-  rotation: 0 | 90
-}
-
 type HistoryState = {
   past: string[]
   present: string
@@ -92,6 +80,22 @@ type FileBrowserItem = {
   handle: LocalFileHandle
 }
 
+type SvgNestApi = {
+  parsesvg: (svgString: string) => SVGSVGElement
+  setbin: (element: Element) => void
+  config: (config?: Record<string, unknown>) => Record<string, unknown>
+  start: (
+    progressCallback: (progress: number) => void,
+    displayCallback: (svgList?: SVGSVGElement[], efficiency?: number, placed?: number, total?: number) => void,
+  ) => boolean
+  stop: () => void
+}
+
+type SvgNestWindow = Window & typeof globalThis & {
+  SvgNest?: SvgNestApi
+  SvgNestEvalPath?: string
+}
+
 type LayerNode = {
   id: string
   elementId: string
@@ -99,18 +103,6 @@ type LayerNode = {
   tag: string
   hidden: boolean
   children: LayerNode[]
-}
-
-type LayoutPart = {
-  id: string
-  part: SVGElement
-  box: DOMRect
-}
-
-type LayoutCluster = {
-  id: string
-  parts: LayoutPart[]
-  box: DOMRect
 }
 
 type SelectedBox = {
@@ -150,6 +142,14 @@ type DragPreview = {
   originY: number
 }
 
+type NestCandidate = {
+  text: string
+  efficiency: number
+  placed: number
+  total: number
+  sheets: number
+}
+
 const BED_WIDTH_MM = 300
 const BED_HEIGHT_MM = 200
 const CUT_RED = 'rgb(255, 0, 0)'
@@ -161,6 +161,18 @@ const HIT_TEST_SELECTOR =
 const NON_PART_SELECTOR = 'defs,style,title,desc,metadata,symbol,clipPath,mask,pattern'
 const MAX_HISTORY = 80
 const HIT_TOLERANCE_PX = 6
+const SVGNEST_BIN_ID = 'k40-svgnest-bin'
+const SVGNEST_SCRIPTS = [
+  'svgnest/util/pathsegpolyfill.js',
+  'svgnest/util/matrix.js',
+  'svgnest/util/domparser.js',
+  'svgnest/util/clipper.js',
+  'svgnest/util/parallel.js',
+  'svgnest/util/geometryutil.js',
+  'svgnest/util/placementworker.js',
+  'svgnest/svgparser.js',
+  'svgnest/svgnest.js',
+]
 
 const sampleSvg = `<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="210mm" height="130mm" viewBox="0 0 210 130">
@@ -311,6 +323,15 @@ function setInlineStyleProperty(element: Element, property: string, value: strin
   element.setAttribute('style', entries.join(';'))
 }
 
+function isElementHidden(element: Element) {
+  return (
+    element.getAttribute('display') === 'none' ||
+    element.getAttribute('visibility') === 'hidden' ||
+    inlineStyleHasValue(element, 'display', 'none') ||
+    inlineStyleHasValue(element, 'visibility', 'hidden')
+  )
+}
+
 function hasSheetGroups(svg: SVGSVGElement) {
   return svg.querySelector(':scope > g[data-k40-sheet]') !== null
 }
@@ -416,11 +437,7 @@ function getLayerTree(text: string): LayerNode[] {
       .map(toNode)
       .filter((node): node is LayerNode => Boolean(node))
     const name = element.getAttribute('data-k40-name') || element.getAttribute('id') || tag
-    const hidden =
-      element.getAttribute('display') === 'none' ||
-      element.getAttribute('visibility') === 'hidden' ||
-      inlineStyleHasValue(element, 'display', 'none') ||
-      inlineStyleHasValue(element, 'visibility', 'hidden')
+    const hidden = isElementHidden(element)
 
     return {
       id,
@@ -908,279 +925,12 @@ function dragPreviewTransform(preview: DragPreview | null, box: SelectedBox) {
   return `translate(${origin.x} ${origin.y}) scale(${preview.scaleX} ${preview.scaleY}) translate(${-origin.x} ${-origin.y})`
 }
 
-function containsBox(outer: DOMRect, inner: DOMRect) {
-  const tolerance = 0.001
-  return (
-    outer !== inner &&
-    inner.x >= outer.x - tolerance &&
-    inner.y >= outer.y - tolerance &&
-    inner.x + inner.width <= outer.x + outer.width + tolerance &&
-    inner.y + inner.height <= outer.y + outer.height + tolerance
-  )
-}
-
 function unionBoxes(boxes: DOMRect[]) {
   const minX = Math.min(...boxes.map((box) => box.x))
   const minY = Math.min(...boxes.map((box) => box.y))
   const maxX = Math.max(...boxes.map((box) => box.x + box.width))
   const maxY = Math.max(...boxes.map((box) => box.y + box.height))
   return new DOMRect(minX, minY, maxX - minX, maxY - minY)
-}
-
-function buildLayoutClusters(parts: LayoutPart[]): LayoutCluster[] {
-  const parentById = new Map<string, string>()
-
-  parts.forEach((part) => {
-    const containers = parts
-      .filter((candidate) => candidate.id !== part.id && containsBox(candidate.box, part.box))
-      .sort((a, b) => a.box.width * a.box.height - b.box.width * b.box.height)
-
-    const parent = containers[0]
-    if (parent) {
-      parentById.set(part.id, parent.id)
-    }
-  })
-
-  function rootFor(part: LayoutPart) {
-    let rootId = part.id
-    const seen = new Set<string>()
-
-    while (parentById.has(rootId) && !seen.has(rootId)) {
-      seen.add(rootId)
-      rootId = parentById.get(rootId)!
-    }
-
-    return rootId
-  }
-
-  const grouped = new Map<string, LayoutPart[]>()
-  parts.forEach((part) => {
-    const rootId = rootFor(part)
-    grouped.set(rootId, [...(grouped.get(rootId) ?? []), part])
-  })
-
-  return Array.from(grouped.entries()).map(([id, clusterParts]) => ({
-    id,
-    parts: clusterParts,
-    box: unionBoxes(clusterParts.map((part) => part.box)),
-  }))
-}
-
-function packItems(
-  items: Array<{ id: string; width: number; height: number }>,
-  gap: number,
-) {
-  type CandidatePlacement = {
-    sheet: number
-    x: number
-    y: number
-    placedWidth: number
-    placedHeight: number
-    rotation: 0 | 90
-    score: number
-  }
-
-  const placements: Placement[] = []
-  const placedBySheet: Array<Array<Placement>> = [[]]
-
-  function overlaps(sheetPlacements: Placement[], x: number, y: number, width: number, height: number) {
-    return sheetPlacements.some((placed) => {
-      return !(
-        x + width + gap <= placed.x ||
-        placed.x + placed.placedWidth + gap <= x ||
-        y + height + gap <= placed.y ||
-        placed.y + placed.placedHeight + gap <= y
-      )
-    })
-  }
-
-  function candidatePositions(sheetPlacements: Placement[]) {
-    const xs = new Set([gap])
-    const ys = new Set([gap])
-
-    sheetPlacements.forEach((placed) => {
-      xs.add(placed.x + placed.placedWidth + gap)
-      xs.add(placed.x)
-      ys.add(placed.y + placed.placedHeight + gap)
-      ys.add(placed.y)
-    })
-
-    return Array.from(xs).flatMap((x) => Array.from(ys).map((y) => ({ x, y })))
-  }
-
-  items.forEach((item) => {
-    let best: CandidatePlacement | null = null
-
-    const orientations: Array<{ placedWidth: number; placedHeight: number; rotation: 0 | 90 }> = [
-      { placedWidth: item.width, placedHeight: item.height, rotation: 0 },
-      { placedWidth: item.height, placedHeight: item.width, rotation: 90 },
-    ]
-
-    for (let sheet = 0; sheet <= placedBySheet.length; sheet += 1) {
-      const sheetPlacements = placedBySheet[sheet] ?? []
-      const candidates = sheetPlacements.length === 0
-        ? [{ x: gap, y: gap }]
-        : candidatePositions(sheetPlacements)
-
-      orientations.forEach((orientation) => {
-        candidates.forEach(({ x, y }) => {
-          if (
-            x + orientation.placedWidth + gap > BED_WIDTH_MM ||
-            y + orientation.placedHeight + gap > BED_HEIGHT_MM ||
-            overlaps(sheetPlacements, x, y, orientation.placedWidth, orientation.placedHeight)
-          ) {
-            return
-          }
-
-          const usedWidth = Math.max(
-            x + orientation.placedWidth,
-            ...sheetPlacements.map((placed) => placed.x + placed.placedWidth),
-          )
-          const usedHeight = Math.max(
-            y + orientation.placedHeight,
-            ...sheetPlacements.map((placed) => placed.y + placed.placedHeight),
-          )
-          const score = sheet * 10_000_000 + usedHeight * 10_000 + usedWidth * 100 + y + x * 0.01
-
-          if (!best || score < best.score) {
-            best = {
-              sheet,
-              x,
-              y,
-              ...orientation,
-              score,
-            }
-          }
-        })
-      })
-    }
-
-    const bestPlacement = best as CandidatePlacement | null
-    const placement: Placement = bestPlacement
-      ? {
-          id: item.id,
-          sheet: bestPlacement.sheet,
-          x: bestPlacement.x,
-          y: bestPlacement.y,
-          width: item.width,
-          height: item.height,
-          placedWidth: bestPlacement.placedWidth,
-          placedHeight: bestPlacement.placedHeight,
-          rotation: bestPlacement.rotation,
-        }
-      : {
-          id: item.id,
-          sheet: placedBySheet.length,
-          x: gap,
-          y: gap,
-          width: item.width,
-          height: item.height,
-          placedWidth: item.width,
-          placedHeight: item.height,
-          rotation: 0,
-        }
-
-    if (!placedBySheet[placement.sheet]) {
-      placedBySheet[placement.sheet] = []
-    }
-
-    placedBySheet[placement.sheet].push(placement)
-    placements.push(placement)
-  })
-
-  return placements
-}
-
-function autoLayoutSvg(text: string, preview: HTMLDivElement | null, gapMm: number) {
-  if (!preview) {
-    throw new Error('The preview is not ready yet.')
-  }
-
-  const source = parseSvg(text)
-  const sourceInfo = getSvgInfo(text)
-  const sourceParts = topLevelParts(source.svg)
-    .filter((part) => part.getAttribute('display') !== 'none' && part.getAttribute('visibility') !== 'hidden')
-    .map((part, index) => {
-      const id = part.getAttribute('data-k40-id') ?? `part-${index}`
-      part.setAttribute('data-k40-id', id)
-      const box = getElementBox(preview, id)
-      return { id, part, box }
-    })
-
-  const layoutParts = sourceParts.filter(
-    (item): item is LayoutPart => Boolean(item.box),
-  )
-  const clusters = buildLayoutClusters(layoutParts)
-  const packedParts = clusters
-    .map((cluster) => ({
-      id: cluster.id,
-      width: cluster.box.width * sourceInfo.unitX,
-      height: cluster.box.height * sourceInfo.unitY,
-    }))
-    .sort((a, b) => b.height * b.width - a.height * a.width)
-
-  if (packedParts.length === 0) {
-    throw new Error('No movable SVG elements were found.')
-  }
-
-  const placements = packItems(packedParts, gapMm)
-  const sheetCount = Math.max(...placements.map((placement) => placement.sheet)) + 1
-  const output = document.implementation.createDocument('http://www.w3.org/2000/svg', 'svg')
-  const outputSvg = output.documentElement as unknown as SVGSVGElement
-  outputSvg.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
-  outputSvg.setAttribute('width', `${BED_WIDTH_MM}mm`)
-  outputSvg.setAttribute('height', `${BED_HEIGHT_MM * sheetCount}mm`)
-  outputSvg.setAttribute('viewBox', `0 0 ${BED_WIDTH_MM} ${BED_HEIGHT_MM * sheetCount}`)
-
-  source.svg.querySelectorAll('defs,style').forEach((node) => {
-    outputSvg.appendChild(output.importNode(node, true))
-  })
-
-  for (let sheetIndex = 0; sheetIndex < sheetCount; sheetIndex += 1) {
-    const group = output.createElementNS('http://www.w3.org/2000/svg', 'g')
-    group.setAttribute('id', `sheet-${sheetIndex + 1}`)
-    group.setAttribute('data-k40-sheet', String(sheetIndex + 1))
-    outputSvg.appendChild(group)
-  }
-
-  placements.forEach((placement) => {
-    const cluster = clusters.find((item) => item.id === placement.id)
-    if (!cluster) {
-      return
-    }
-
-    const sheetGroup = outputSvg.querySelector(`#sheet-${placement.sheet + 1}`)
-    if (!sheetGroup) {
-      return
-    }
-
-    const wrapper = output.createElementNS('http://www.w3.org/2000/svg', 'g')
-    const box = cluster.box
-    const targetY = placement.sheet * BED_HEIGHT_MM + placement.y
-    const transform = placement.rotation === 90
-      ? [
-          `translate(${(placement.x + box.height * sourceInfo.unitY).toFixed(4)} ${targetY.toFixed(4)})`,
-          'rotate(90)',
-          `translate(${(-box.x * sourceInfo.unitX).toFixed(4)} ${(-box.y * sourceInfo.unitY).toFixed(4)})`,
-          `scale(${sourceInfo.unitX.toFixed(6)} ${sourceInfo.unitY.toFixed(6)})`,
-        ].join(' ')
-      : [
-          `translate(${(placement.x - box.x * sourceInfo.unitX).toFixed(4)} ${(targetY - box.y * sourceInfo.unitY).toFixed(4)})`,
-          `scale(${sourceInfo.unitX.toFixed(6)} ${sourceInfo.unitY.toFixed(6)})`,
-        ].join(' ')
-
-    wrapper.setAttribute('transform', transform)
-    cluster.parts.forEach((sourcePart) => {
-      wrapper.appendChild(output.importNode(sourcePart.part, true))
-    })
-    sheetGroup.appendChild(wrapper)
-  })
-
-  return {
-    text: serializeSvg(output),
-    sheetCount,
-    placements,
-  }
 }
 
 function downloadSvg(text: string, fileName: string) {
@@ -1237,6 +987,141 @@ async function writeSvgFile(handle: LocalFileHandle, text: string) {
   const writable = await handle.createWritable()
   await writable.write(text)
   await writable.close()
+}
+
+let svgNestLoadPromise: Promise<SvgNestApi> | null = null
+
+function loadScriptOnce(src: string) {
+  const existing = document.querySelector(`script[data-k40-script="${CSS.escape(src)}"]`)
+  if (existing) {
+    return Promise.resolve()
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    const script = document.createElement('script')
+    script.src = `${import.meta.env.BASE_URL}${src}`
+    script.async = false
+    script.dataset.k40Script = src
+    script.addEventListener('load', () => resolve(), { once: true })
+    script.addEventListener('error', () => reject(new Error(`Could not load ${src}`)), { once: true })
+    document.head.appendChild(script)
+  })
+}
+
+async function loadSvgNest() {
+  ;(window as SvgNestWindow).SvgNestEvalPath = `${import.meta.env.BASE_URL}svgnest/util/eval.js`
+
+  if (!svgNestLoadPromise) {
+    svgNestLoadPromise = (async () => {
+      for (const script of SVGNEST_SCRIPTS) {
+        await loadScriptOnce(script)
+      }
+
+      const api = (window as SvgNestWindow).SvgNest
+      if (!api) {
+        throw new Error('SVGnest did not initialise.')
+      }
+
+      return api
+    })()
+  }
+
+  return svgNestLoadPromise
+}
+
+function cloneVisibleSvgElement(element: SVGElement) {
+  if (isElementHidden(element)) {
+    return null
+  }
+
+  const clone = element.cloneNode(true) as SVGElement
+  clone.querySelectorAll(GRAPHIC_SELECTOR).forEach((child) => {
+    if (isElementHidden(child)) {
+      child.remove()
+    }
+  })
+  return clone
+}
+
+function createSvgNestInput(text: string) {
+  const source = parseSvg(text)
+  const output = document.implementation.createDocument('http://www.w3.org/2000/svg', 'svg')
+  const svg = output.documentElement as unknown as SVGSVGElement
+  svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+  svg.setAttribute('width', `${BED_WIDTH_MM}mm`)
+  svg.setAttribute('height', `${BED_HEIGHT_MM}mm`)
+  svg.setAttribute('viewBox', `0 0 ${BED_WIDTH_MM} ${BED_HEIGHT_MM}`)
+
+  source.svg.querySelectorAll('defs,style').forEach((node) => {
+    svg.appendChild(output.importNode(node, true))
+  })
+
+  const bin = output.createElementNS('http://www.w3.org/2000/svg', 'rect')
+  bin.setAttribute('id', SVGNEST_BIN_ID)
+  bin.setAttribute('x', '0')
+  bin.setAttribute('y', '0')
+  bin.setAttribute('width', String(BED_WIDTH_MM))
+  bin.setAttribute('height', String(BED_HEIGHT_MM))
+  bin.setAttribute('fill', 'none')
+  bin.setAttribute('stroke', 'none')
+  svg.appendChild(bin)
+
+  let partCount = 0
+  topLevelParts(source.svg).forEach((part) => {
+    const clone = cloneVisibleSvgElement(part)
+    if (!clone) {
+      return
+    }
+
+    svg.appendChild(output.importNode(clone, true))
+    partCount += 1
+  })
+
+  if (partCount === 0) {
+    throw new Error('No visible vector parts were found.')
+  }
+
+  return serializeSvg(output)
+}
+
+function isSvgNestBinElement(element: Element) {
+  const classes = (element.getAttribute('class') ?? '').split(/\s+/)
+  return element.getAttribute('id') === SVGNEST_BIN_ID || classes.includes('bin')
+}
+
+function combineSvgNestSheets(svgList: SVGSVGElement[], sourceText: string) {
+  const source = parseSvg(sourceText)
+  const output = document.implementation.createDocument('http://www.w3.org/2000/svg', 'svg')
+  const svg = output.documentElement as unknown as SVGSVGElement
+  const sheetCount = Math.max(1, svgList.length)
+
+  svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+  svg.setAttribute('width', `${BED_WIDTH_MM}mm`)
+  svg.setAttribute('height', `${BED_HEIGHT_MM * sheetCount}mm`)
+  svg.setAttribute('viewBox', `0 0 ${BED_WIDTH_MM} ${BED_HEIGHT_MM * sheetCount}`)
+
+  source.svg.querySelectorAll('defs,style').forEach((node) => {
+    svg.appendChild(output.importNode(node, true))
+  })
+
+  svgList.forEach((sheetSvg, sheetIndex) => {
+    const group = output.createElementNS('http://www.w3.org/2000/svg', 'g')
+    group.setAttribute('id', `sheet-${sheetIndex + 1}`)
+    group.setAttribute('data-k40-sheet', String(sheetIndex + 1))
+    group.setAttribute('transform', `translate(0 ${sheetIndex * BED_HEIGHT_MM})`)
+
+    Array.from(sheetSvg.children).forEach((child) => {
+      if (child.matches(NON_PART_SELECTOR) || isSvgNestBinElement(child)) {
+        return
+      }
+
+      group.appendChild(output.importNode(child, true))
+    })
+
+    svg.appendChild(group)
+  })
+
+  return serializeSvg(output)
 }
 
 function LayerTree({
@@ -1373,8 +1258,15 @@ function App() {
   const [targetDistance, setTargetDistance] = useState('')
   const [gapMm, setGapMm] = useState(2)
   const [status, setStatus] = useState('Sample loaded')
+  const [nestOpen, setNestOpen] = useState(false)
+  const [nestRunning, setNestRunning] = useState(false)
+  const [nestStatus, setNestStatus] = useState('')
+  const [nestProgress, setNestProgress] = useState(0)
+  const [nestCandidate, setNestCandidate] = useState<NestCandidate | null>(null)
   const previewRef = useRef<HTMLDivElement>(null)
   const dragStateRef = useRef<DragState | null>(null)
+  const svgNestRef = useRef<SvgNestApi | null>(null)
+  const nestRunIdRef = useRef(0)
   const svgText = history.present
   const isDirty = svgText !== savedText
 
@@ -1400,6 +1292,12 @@ function App() {
 
     return () => cancelAnimationFrame(frame)
   }, [selectedIds, svgText])
+
+  useEffect(() => {
+    return () => {
+      svgNestRef.current?.stop()
+    }
+  }, [])
 
   function commitSvg(nextText: string, nextStatus: string, reset = false) {
     setHistory((current) => {
@@ -1838,17 +1736,105 @@ function App() {
     )
   }
 
-  function runAutoLayout() {
+  function stopNestWorkflow(nextStatus = 'SVGnest search stopped') {
+    nestRunIdRef.current += 1
+    svgNestRef.current?.stop()
+    setNestRunning(false)
+    setNestStatus(nextStatus)
+  }
+
+  function closeNestWorkflow() {
+    stopNestWorkflow('SVGnest search cancelled')
+    setNestOpen(false)
+  }
+
+  async function openNestWorkflow() {
+    const runId = nestRunIdRef.current + 1
+    nestRunIdRef.current = runId
+    setNestOpen(true)
+    setNestRunning(false)
+    setNestCandidate(null)
+    setNestProgress(0)
+    setNestStatus('Loading SVGnest...')
+
     try {
-      const result = autoLayoutSvg(svgText, previewRef.current, gapMm)
-      commitSvg(
-        normaliseSvg(result.text),
-        `${result.placements.length} elements packed into ${result.sheetCount} sheet${result.sheetCount === 1 ? '' : 's'}`,
+      const api = await loadSvgNest()
+      if (runId !== nestRunIdRef.current) {
+        return
+      }
+
+      svgNestRef.current = api
+      api.stop()
+      api.config({
+        spacing: Math.max(0, gapMm),
+        rotations: 8,
+        populationSize: 12,
+        mutationRate: 10,
+        useHoles: true,
+        exploreConcave: false,
+        curveTolerance: 0.3,
+      })
+
+      const sourceText = svgText
+      const nestInput = createSvgNestInput(sourceText)
+      const parsedSvg = api.parsesvg(nestInput)
+      const bin = parsedSvg.querySelector(`#${SVGNEST_BIN_ID}`)
+      if (!bin) {
+        throw new Error('Could not prepare the K40 bed for SVGnest.')
+      }
+
+      api.setbin(bin)
+      setNestRunning(true)
+      setNestStatus('Searching for a compact SVGnest layout...')
+
+      const started = api.start(
+        (progress) => {
+          if (runId === nestRunIdRef.current) {
+            const percent = progress <= 1 ? progress * 100 : progress
+            setNestProgress(Math.max(0, Math.min(100, percent)))
+          }
+        },
+        (svgList, efficiency = 0, placed = 0, total = 0) => {
+          if (runId !== nestRunIdRef.current || !svgList || svgList.length === 0) {
+            return
+          }
+
+          const text = combineSvgNestSheets(svgList, sourceText)
+          setNestCandidate({
+            text,
+            efficiency,
+            placed,
+            total,
+            sheets: svgList.length,
+          })
+          setNestStatus(
+            `Best so far: ${placed}/${total} parts on ${svgList.length} sheet${svgList.length === 1 ? '' : 's'} (${Math.round(efficiency * 100)}% bed use)`,
+          )
+        },
       )
-      setSelectedIds([])
+
+      if (started === false) {
+        throw new Error('SVGnest could not start. Check that the document contains closed vector outlines.')
+      }
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : 'Auto layout failed')
+      setNestRunning(false)
+      setNestStatus(error instanceof Error ? error.message : 'SVGnest could not prepare this document.')
+      setStatus(error instanceof Error ? error.message : 'SVGnest failed')
     }
+  }
+
+  function acceptNestCandidate() {
+    if (!nestCandidate) {
+      return
+    }
+
+    stopNestWorkflow('SVGnest layout accepted')
+    commitSvg(
+      normaliseSvg(nestCandidate.text),
+      `${nestCandidate.placed}/${nestCandidate.total} parts nested into ${nestCandidate.sheets} sheet${nestCandidate.sheets === 1 ? '' : 's'}`,
+    )
+    setSelectedIds([])
+    setNestOpen(false)
   }
 
   function resetSample() {
@@ -2229,7 +2215,7 @@ function App() {
                 <span className="unit">mm</span>
               </div>
             </label>
-            <button type="button" className="primary-action" onClick={runAutoLayout}>
+            <button type="button" className="primary-action" onClick={() => void openNestWorkflow()}>
               Auto-position elements
             </button>
           </div>
@@ -2269,6 +2255,61 @@ function App() {
           Files
         </button>
       )}
+      {nestOpen ? (
+        <div className="modal-backdrop nest-backdrop" role="presentation">
+          <div
+            className="nest-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="nest-dialog-title"
+          >
+            <header className="nest-header">
+              <div>
+                <h2 id="nest-dialog-title">SVGnest auto-positioning</h2>
+                <p>{nestStatus}</p>
+              </div>
+              <button type="button" className="icon-button" onClick={closeNestWorkflow}>
+                Close
+              </button>
+            </header>
+            <div className="nest-progress" aria-label={`SVGnest search progress ${nestProgress.toFixed(0)} percent`}>
+              <span style={{ width: `${nestProgress}%` }} />
+            </div>
+            <div className="nest-preview">
+              {nestCandidate ? (
+                <div dangerouslySetInnerHTML={{ __html: nestCandidate.text }} />
+              ) : (
+                <div className="nest-empty">Waiting for the first layout...</div>
+              )}
+            </div>
+            <footer className="nest-actions">
+              <button
+                type="button"
+                onClick={() => {
+                  if (nestRunning) {
+                    stopNestWorkflow()
+                  } else {
+                    void openNestWorkflow()
+                  }
+                }}
+              >
+                {nestRunning ? 'Stop search' : 'Restart search'}
+              </button>
+              <button type="button" onClick={closeNestWorkflow}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="primary-action"
+                onClick={acceptNestCandidate}
+                disabled={!nestCandidate}
+              >
+                Accept layout
+              </button>
+            </footer>
+          </div>
+        </div>
+      ) : null}
       {pendingFile ? (
         <div className="modal-backdrop" role="presentation">
           <div

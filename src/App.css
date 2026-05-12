@@ -802,6 +802,105 @@ input {
   gap: 8px;
 }
 
+.nest-backdrop {
+  z-index: 24;
+}
+
+.nest-dialog {
+  width: min(1180px, calc(100vw - 48px));
+  height: min(820px, calc(100vh - 48px));
+  display: grid;
+  grid-template-rows: auto auto 1fr auto;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid #cbd4dd;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 32px 90px rgba(22, 31, 46, 0.3);
+}
+
+.nest-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.nest-header h2,
+.nest-header p {
+  margin: 0;
+}
+
+.nest-header h2 {
+  color: var(--ink);
+  font-size: 18px;
+}
+
+.nest-header p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+
+.nest-progress {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e7edf2;
+}
+
+.nest-progress span {
+  display: block;
+  height: 100%;
+  min-width: 2px;
+  border-radius: inherit;
+  background: #006bb3;
+  transition: width 160ms ease;
+}
+
+.nest-preview {
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  border: 1px solid #d8e0e8;
+  border-radius: 8px;
+  background:
+    linear-gradient(#eef1f4 1px, transparent 1px),
+    linear-gradient(90deg, #eef1f4 1px, transparent 1px),
+    #ffffff;
+  background-size: 18px 18px;
+}
+
+.nest-preview > div:not(.nest-empty) {
+  width: min(100%, 980px);
+  min-width: 420px;
+  padding: 20px;
+}
+
+.nest-preview svg {
+  width: 100%;
+  height: auto;
+  display: block;
+  overflow: visible;
+}
+
+.nest-empty {
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.nest-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 @media (max-width: 1040px) {
   .topbar {
     align-items: flex-start;
