@@ -460,7 +460,7 @@ input {
 
 .layer-row {
   display: grid;
-  grid-template-columns: 42px 54px minmax(0, 1fr);
+  grid-template-columns: 28px 34px 54px minmax(0, 1fr);
   align-items: center;
   gap: 7px;
   min-height: 35px;
@@ -482,7 +482,43 @@ input {
   font-size: 11px;
 }
 
+.collapse-toggle {
+  position: relative;
+  min-width: 28px;
+  padding: 0;
+  color: #526273;
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+.collapse-toggle:hover {
+  box-shadow: none;
+  transform: none;
+}
+
+.collapse-toggle:disabled {
+  background: transparent;
+  border-color: transparent;
+}
+
+.collapse-toggle span {
+  width: 0;
+  height: 0;
+  border-top: 5px solid #526273;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  transform: rotate(0deg);
+  transition: transform 140ms ease;
+}
+
+.collapse-toggle.collapsed span {
+  transform: rotate(-90deg);
+}
+
 .visibility-toggle {
+  min-width: 34px;
+  padding: 0;
   color: #0d6b45;
   border-color: #bcd8ca;
   background: #eaf7f0;
@@ -492,6 +528,38 @@ input {
   color: #697586;
   border-color: #d1d8df;
   background: #edf0f3;
+}
+
+.eye-icon {
+  position: relative;
+  width: 16px;
+  height: 10px;
+  border: 1.7px solid currentColor;
+  border-radius: 50%;
+}
+
+.eye-icon::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  transform: translate(-50%, -50%);
+}
+
+.visibility-toggle.muted .eye-icon::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: -4px;
+  width: 2px;
+  height: 18px;
+  border-radius: 999px;
+  background: currentColor;
+  transform: translateX(-50%) rotate(45deg);
 }
 
 .layer-tag {
@@ -632,10 +700,26 @@ input {
   cursor: copy;
 }
 
+.svg-preview.mode-select {
+  cursor: default;
+}
+
+.svg-preview.can-select {
+  cursor: pointer;
+}
+
 .svg-preview.mode-select :is(path,line,polyline,polygon,rect,circle,ellipse),
 .svg-preview.mode-cut :is(path,line,polyline,polygon,rect,circle,ellipse),
 .svg-preview.mode-engrave :is(path,line,polyline,polygon,rect,circle,ellipse) {
   pointer-events: visiblePainted;
+}
+
+.svg-preview :is(path,line,polyline,polygon,rect,circle,ellipse)[stroke='rgb(255, 0, 0)'],
+.svg-preview :is(path,line,polyline,polygon,rect,circle,ellipse)[stroke='rgb(0, 0, 255)'],
+.svg-preview :is(path,line,polyline,polygon,rect,circle,ellipse)[stroke='#ff0000'],
+.svg-preview :is(path,line,polyline,polygon,rect,circle,ellipse)[stroke='#0000ff'] {
+  stroke-width: 1px !important;
+  vector-effect: non-scaling-stroke;
 }
 
 .svg-preview.mode-select :is(text,image,use),

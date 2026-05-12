@@ -161,9 +161,11 @@ type NestPart = {
   box: DOMRect
 }
 
-type SheetCluster = {
-  parts: NestPart[]
-  box: DOMRect
+type PackedNestPart = {
+  part: NestPart
+  sheet: number
+  x: number
+  y: number
 }
 
 const BED_WIDTH_MM = 300
@@ -176,7 +178,8 @@ const HIT_TEST_SELECTOR =
   'path,line,polyline,polygon,rect,circle,ellipse,image,use,text'
 const NON_PART_SELECTOR = 'defs,style,title,desc,metadata,symbol,clipPath,mask,pattern'
 const MAX_HISTORY = 80
-const HIT_TOLERANCE_PX = 6
+const HIT_TOLERANCE_PX = 12
+const VECTOR_STROKE_WIDTH = '1px'
 const SVGNEST_BIN_ID = 'k40-svgnest-bin'
 const SVGNEST_SCRIPTS = [
   'svgnest/util/pathsegpolyfill.js',
@@ -315,6 +318,13 @@ function inlineStyleHasValue(element: Element, property: string, value: string) 
   })
 }
 
+function inlineStyleValue(element: Element, property: string) {
+  const targetProperty = property.toLowerCase()
+  const entry = styleEntries(element.getAttribute('style') ?? '')
+    .find((styleEntry) => styleEntry.property === targetProperty)
+  return entry?.value.replace(/\s*!important\s*$/i, '').trim() ?? null
+}
+
 function removeInlineStyleProperties(element: Element, properties: string[]) {
   const propertySet = new Set(properties.map((property) => property.toLowerCase()))
   const nextStyle = styleEntries(element.getAttribute('style') ?? '')
@@ -346,6 +356,28 @@ function isElementHidden(element: Element) {
     inlineStyleHasValue(element, 'display', 'none') ||
     inlineStyleHasValue(element, 'visibility', 'hidden')
   )
+}
+
+function compactColor(value: string | null) {
+  return value?.replace(/\s+/g, '').toLowerCase() ?? ''
+}
+
+function isK40VectorStroke(value: string | null) {
+  const color = compactColor(value)
+  return ['rgb(255,0,0)', '#ff0000', 'red', 'rgb(0,0,255)', '#0000ff', 'blue'].includes(color)
+}
+
+function setVectorStrokeStyle(element: Element) {
+  element.setAttribute('stroke-width', VECTOR_STROKE_WIDTH)
+  element.setAttribute('vector-effect', 'non-scaling-stroke')
+  setInlineStyleProperty(element, 'stroke-width', VECTOR_STROKE_WIDTH)
+}
+
+function keepVectorStrokeWidth(element: Element) {
+  const stroke = element.getAttribute('stroke') ?? inlineStyleValue(element, 'stroke')
+  if (isK40VectorStroke(stroke)) {
+    setVectorStrokeStyle(element)
+  }
 }
 
 function hasSheetGroups(svg: SVGSVGElement) {
@@ -441,6 +473,8 @@ function normaliseSvg(text: string) {
       const id = element.getAttribute('id')
       element.setAttribute('data-k40-name', id || element.nodeName.toLowerCase())
     }
+
+    keepVectorStrokeWidth(element)
   })
 
   return serializeSvg(doc)
@@ -581,11 +615,13 @@ function updateElementStroke(text: string, id: string, color: string) {
     element.querySelectorAll(GRAPHIC_SELECTOR).forEach((child) => {
       if (child.nodeName.toLowerCase() !== 'image') {
         child.setAttribute('stroke', color)
+        setVectorStrokeStyle(child)
         child.setAttribute('fill', child.getAttribute('fill') === 'none' ? 'none' : child.getAttribute('fill') ?? 'none')
       }
     })
   } else if (element.nodeName.toLowerCase() !== 'image') {
     element.setAttribute('stroke', color)
+    setVectorStrokeStyle(element)
     if (!element.getAttribute('fill')) {
       element.setAttribute('fill', 'none')
     }
@@ -701,34 +737,71 @@ function geometryContainsPointNear(
   })
 }
 
+function distanceToGeometryElement(element: SVGGeometryElement, clientX: number, clientY: number, tolerance: number) {
+  if (geometryContainsPointNear(element, clientX, clientY, tolerance)) {
+    return 0
+  }
+
+  const matrix = element.getScreenCTM()
+  if (!matrix) {
+    return Number.POSITIVE_INFINITY
+  }
+
+  try {
+    const length = element.getTotalLength()
+    if (!Number.isFinite(length) || length <= 0) {
+      return Number.POSITIVE_INFINITY
+    }
+
+    const steps = Math.max(12, Math.min(96, Math.ceil(length / 3)))
+    let bestDistance = Number.POSITIVE_INFINITY
+
+    for (let index = 0; index <= steps; index += 1) {
+      const localPoint = element.getPointAtLength((length * index) / steps)
+      const screenPoint = localPoint.matrixTransform(matrix)
+      bestDistance = Math.min(bestDistance, Math.hypot(screenPoint.x - clientX, screenPoint.y - clientY))
+    }
+
+    return bestDistance
+  } catch {
+    return Number.POSITIVE_INFINITY
+  }
+}
+
 function findNearestClickableTarget(preview: HTMLDivElement | null, clientX: number, clientY: number) {
   const svg = preview?.querySelector('svg') as SVGSVGElement | null
   if (!svg) {
     return null
   }
 
+  const tolerance = HIT_TOLERANCE_PX
   const candidates = Array.from(svg.querySelectorAll(HIT_TEST_SELECTOR)) as SVGElement[]
-  for (const element of candidates.reverse()) {
+  let best: { element: SVGElement; distance: number; order: number } | null = null
+
+  for (const [order, element] of candidates.entries()) {
     if (!element.getAttribute('data-k40-id')) {
       continue
     }
 
     const rect = element.getBoundingClientRect()
-    if (rect.width === 0 || rect.height === 0 || !pointInExpandedRect(rect, clientX, clientY, HIT_TOLERANCE_PX)) {
+    if (rect.width === 0 || rect.height === 0 || !pointInExpandedRect(rect, clientX, clientY, tolerance * 1.6)) {
       continue
     }
 
+    let distance = 0
     if (element instanceof SVGGeometryElement) {
-      if (geometryContainsPointNear(element, clientX, clientY, HIT_TOLERANCE_PX)) {
-        return element
+      distance = distanceToGeometryElement(element, clientX, clientY, tolerance)
+      if (distance > tolerance) {
+        continue
       }
-      continue
     }
 
-    return element
+    if (!best || distance < best.distance || (distance === best.distance && order > best.order)) {
+      best = { element, distance, order }
+    }
   }
 
-  return null
+  return best ? best.element : null
 }
 
 function getClickableTarget(
@@ -1231,67 +1304,96 @@ function measureNestParts(sheetSvg: SVGSVGElement, canvas: { width: number; heig
   }
 }
 
-function boxDistance(a: DOMRect, b: DOMRect) {
-  const dx = Math.max(a.x - (b.x + b.width), b.x - (a.x + a.width), 0)
-  const dy = Math.max(a.y - (b.y + b.height), b.y - (a.y + a.height), 0)
-  return Math.hypot(dx, dy)
+function expandedOverlap(
+  a: { x: number; y: number; width: number; height: number },
+  b: { x: number; y: number; width: number; height: number },
+  gap: number,
+) {
+  return !(
+    a.x + a.width + gap <= b.x ||
+    b.x + b.width + gap <= a.x ||
+    a.y + a.height + gap <= b.y ||
+    b.y + b.height + gap <= a.y
+  )
 }
 
-function canFitOnSheet(box: DOMRect) {
-  return box.width <= BED_WIDTH_MM && box.height <= BED_HEIGHT_MM
+function sheetCandidatePositions(placed: PackedNestPart[], gap: number) {
+  const xs = new Set([0])
+  const ys = new Set([0])
+
+  placed.forEach((item) => {
+    xs.add(item.x)
+    xs.add(item.x + item.part.box.width + gap)
+    ys.add(item.y)
+    ys.add(item.y + item.part.box.height + gap)
+  })
+
+  return Array.from(xs).flatMap((x) => Array.from(ys).map((y) => ({ x, y })))
 }
 
-function clusterNestParts(parts: NestPart[]) {
-  const remaining = [...parts].sort((a, b) => a.box.y - b.box.y || a.box.x - b.box.x)
-  const clusters: SheetCluster[] = []
+function packNestParts(parts: NestPart[], gap: number) {
+  const orderedParts = [...parts].sort((a, b) => {
+    const areaA = a.box.width * a.box.height
+    const areaB = b.box.width * b.box.height
+    return areaB - areaA || Math.max(b.box.width, b.box.height) - Math.max(a.box.width, a.box.height)
+  })
+  const packed: PackedNestPart[] = []
 
-  while (remaining.length > 0) {
-    const seed = remaining.shift()!
-    let clusterParts = [seed]
-    let clusterBox = seed.box
+  orderedParts.forEach((part) => {
+    let best: { sheet: number; x: number; y: number; score: number } | null = null
+    const currentSheetCount = Math.max(1, Math.max(-1, ...packed.map((item) => item.sheet)) + 1)
 
-    if (canFitOnSheet(clusterBox)) {
-      let added = true
-      while (added) {
-        added = false
-        const candidates = remaining
-          .map((part, index) => ({
-            part,
-            index,
-            box: unionBoxes([...clusterParts.map((item) => item.box), part.box]),
-          }))
-          .filter((candidate) => canFitOnSheet(candidate.box))
-          .sort((a, b) => boxDistance(clusterBox, a.part.box) - boxDistance(clusterBox, b.part.box))
+    for (let sheet = 0; sheet <= currentSheetCount; sheet += 1) {
+      const sheetParts = packed.filter((item) => item.sheet === sheet)
+      const candidates = sheetParts.length === 0 ? [{ x: 0, y: 0 }] : sheetCandidatePositions(sheetParts, gap)
 
-        const best = candidates[0]
-        if (best) {
-          clusterParts = [...clusterParts, best.part]
-          clusterBox = best.box
-          remaining.splice(best.index, 1)
-          added = true
+      candidates.forEach(({ x, y }) => {
+        if (
+          x + part.box.width > BED_WIDTH_MM ||
+          y + part.box.height > BED_HEIGHT_MM ||
+          sheetParts.some((item) => expandedOverlap(
+            { x, y, width: part.box.width, height: part.box.height },
+            { x: item.x, y: item.y, width: item.part.box.width, height: item.part.box.height },
+            gap,
+          ))
+        ) {
+          return
         }
-      }
+
+        const usedWidth = Math.max(x + part.box.width, ...sheetParts.map((item) => item.x + item.part.box.width))
+        const usedHeight = Math.max(y + part.box.height, ...sheetParts.map((item) => item.y + item.part.box.height))
+        const fullness = Math.max(usedWidth / BED_WIDTH_MM, usedHeight / BED_HEIGHT_MM)
+        const score = sheet * 1_000_000 + fullness * 10_000 + usedHeight * 10 + y + x * 0.01
+
+        if (!best || score < best.score) {
+          best = { sheet, x, y, score }
+        }
+      })
     }
 
-    clusters.push({
-      parts: clusterParts,
-      box: clusterBox,
-    })
-  }
+    const bestPlacement = best as { sheet: number; x: number; y: number; score: number } | null
+    packed.push(bestPlacement
+      ? { part, sheet: bestPlacement.sheet, x: bestPlacement.x, y: bestPlacement.y }
+      : { part, sheet: currentSheetCount, x: 0, y: 0 })
+  })
 
-  return clusters
+  return packed
 }
 
 function combineSvgNestSheets(
   svgList: SVGSVGElement[],
   sourceText: string,
   canvas: SvgNestInput,
+  gap: number,
 ) {
   const source = parseSvg(sourceText)
-  const clusters = svgList.flatMap((sheetSvg) => clusterNestParts(measureNestParts(sheetSvg, canvas)))
+  const packedParts = packNestParts(
+    svgList.flatMap((sheetSvg) => measureNestParts(sheetSvg, canvas)),
+    Math.max(0, gap),
+  )
   const output = document.implementation.createDocument('http://www.w3.org/2000/svg', 'svg')
   const svg = output.documentElement as unknown as SVGSVGElement
-  const sheetCount = Math.max(1, clusters.length)
+  const sheetCount = Math.max(1, Math.max(-1, ...packedParts.map((item) => item.sheet)) + 1)
 
   svg.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
   svg.setAttribute('width', `${BED_WIDTH_MM}mm`)
@@ -1302,7 +1404,7 @@ function combineSvgNestSheets(
     svg.appendChild(output.importNode(node, true))
   })
 
-  clusters.forEach((cluster, sheetIndex) => {
+  for (let sheetIndex = 0; sheetIndex < sheetCount; sheetIndex += 1) {
     const group = output.createElementNS('http://www.w3.org/2000/svg', 'g')
     group.setAttribute('id', `sheet-${sheetIndex + 1}`)
     group.setAttribute('data-k40-id', `sheet-${sheetIndex + 1}`)
@@ -1313,18 +1415,20 @@ function combineSvgNestSheets(
       group.setAttribute('data-k40-hidden', 'true')
       setInlineStyleProperty(group, 'display', 'none')
     }
-    group.setAttribute(
-      'transform',
-      `translate(${(-cluster.box.x).toFixed(4)} ${(-cluster.box.y).toFixed(4)})`,
-    )
 
-    cluster.parts.forEach((part) => {
-      const imported = output.importNode(part.element, true) as Element
-      group.appendChild(imported)
-    })
+    packedParts
+      .filter((item) => item.sheet === sheetIndex)
+      .forEach((item) => {
+        const imported = output.importNode(item.part.element, true) as Element
+        prependTransform(
+          imported,
+          `translate(${(item.x - item.part.box.x).toFixed(4)} ${(item.y - item.part.box.y).toFixed(4)})`,
+        )
+        group.appendChild(imported)
+      })
 
     svg.appendChild(group)
-  })
+  }
 
   return {
     text: serializeSvg(output),
@@ -1345,8 +1449,24 @@ function LayerTree({
   onSelect: (id: string, additive: boolean) => void
   onToggleVisibility: (id: string, visible: boolean) => void
 }) {
+  const [collapsedIds, setCollapsedIds] = useState<Set<string>>(() => new Set())
+
+  function toggleCollapsed(id: string) {
+    setCollapsedIds((current) => {
+      const next = new Set(current)
+      if (next.has(id)) {
+        next.delete(id)
+      } else {
+        next.add(id)
+      }
+      return next
+    })
+  }
+
   function renderNode(node: LayerNode, depth: number) {
     const isSelected = selectedIds.includes(node.id)
+    const hasChildren = node.children.length > 0
+    const isCollapsed = collapsedIds.has(node.id)
 
     return (
       <li className="layer-item" key={`${node.id}-${node.name}-${node.hidden}`}>
@@ -1357,6 +1477,19 @@ function LayerTree({
         >
           <button
             type="button"
+            className={`icon-button collapse-toggle ${isCollapsed ? 'collapsed' : ''}`}
+            disabled={!hasChildren}
+            onClick={(event) => {
+              event.stopPropagation()
+              toggleCollapsed(node.id)
+            }}
+            aria-label={isCollapsed ? `Open ${node.name}` : `Collapse ${node.name}`}
+            title={isCollapsed ? 'Open group' : 'Collapse group'}
+          >
+            <span aria-hidden="true" />
+          </button>
+          <button
+            type="button"
             className={`icon-button visibility-toggle ${node.hidden ? 'muted' : ''}`}
             onClick={(event) => {
               event.stopPropagation()
@@ -1365,7 +1498,7 @@ function LayerTree({
             aria-label={node.hidden ? `Show ${node.name}` : `Hide ${node.name}`}
             title={node.hidden ? 'Show layer' : 'Hide layer'}
           >
-            {node.hidden ? 'Off' : 'On'}
+            <span className="eye-icon" aria-hidden="true" />
           </button>
           <span className="layer-tag">{node.tag}</span>
           <input
@@ -1381,7 +1514,7 @@ function LayerTree({
             }}
           />
         </div>
-        {node.children.length > 0 ? (
+        {hasChildren && !isCollapsed ? (
           <ul className="layer-children">
             {node.children.map((child) => renderNode(child, depth + 1))}
           </ul>
@@ -1462,6 +1595,7 @@ function App() {
   const [selectedPoints, setSelectedPoints] = useState<Point[]>([])
   const [selectedIds, setSelectedIds] = useState<string[]>([])
   const [selectionBox, setSelectionBox] = useState<SelectedBox | null>(null)
+  const [hoverSelectable, setHoverSelectable] = useState(false)
   const [dragPreview, setDragPreview] = useState<DragPreview | null>(null)
   const [targetDistance, setTargetDistance] = useState('')
   const [gapMm, setGapMm] = useState(2)
@@ -1845,6 +1979,12 @@ function App() {
   function updateSelectionDrag(event: PointerEvent<Element>) {
     const dragState = dragStateRef.current
     if (!dragState || dragState.pointerId !== event.pointerId) {
+      if (
+        event.currentTarget === previewRef.current &&
+        (toolMode === 'select' || toolMode === 'cut' || toolMode === 'engrave')
+      ) {
+        setHoverSelectable(Boolean(getClickableTarget(event.target, previewRef.current, event.clientX, event.clientY)))
+      }
       return
     }
 
@@ -2009,7 +2149,7 @@ function App() {
             return
           }
 
-          const result = combineSvgNestSheets(svgList, sourceText, nestInput)
+          const result = combineSvgNestSheets(svgList, sourceText, nestInput, gapMm)
           setNestCandidate({
             text: result.text,
             efficiency,
@@ -2269,10 +2409,11 @@ function App() {
             <div className="bed-ruler y">200 mm</div>
             <div
               ref={previewRef}
-              className={`svg-preview mode-${toolMode}`}
+              className={`svg-preview mode-${toolMode} ${hoverSelectable ? 'can-select' : ''}`}
               onClick={handlePreviewClick}
               onPointerDown={handlePreviewPointerDown}
               onPointerMove={updateSelectionDrag}
+              onPointerLeave={() => setHoverSelectable(false)}
               onPointerUp={endSelectionDrag}
               onPointerCancel={endSelectionDrag}
               dangerouslySetInnerHTML={{ __html: svgText }}
